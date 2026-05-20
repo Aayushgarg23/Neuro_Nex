@@ -1,0 +1,29 @@
+# Python dependencies and environments
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Node.js dependencies
+node_modules/
+dist/
+.next/
+out/
+.env
+
+# Database and docker volumes
+postgres_data/
+neo4j_data/
+redis_data/
+.chroma/
+
+# Operating system and IDE garbage
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
