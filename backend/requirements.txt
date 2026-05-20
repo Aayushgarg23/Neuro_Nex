@@ -1,0 +1,14 @@
+fastapi>=0.121.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.11.1
+pydantic-settings>=2.8.1
+langgraph>=1.2.0
+langgraph-checkpoint-postgres>=3.0.1
+psycopg[binary]>=3.3.2
+langchain-core>=1.0.4
+langchain-neo4j>=0.1.0
+langgraph-bigtool>=0.0.3
+numpy>=1.24.0
+scipy>=1.10.0
+cryptography>=42.0.0
+python-dotenv>=1.1.0

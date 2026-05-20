@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  postgres-db:
+    image: pgvector/pgvector:pg15
+    container_name: neuronex-postgres
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_pass
+      POSTGRES_DB: neuronex_db
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  neo4j-graph:
+    image: neo4j:5-community
+    container_name: neuronex-neo4j
+
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+
+    environment:
+      NEO4J_AUTH: neo4j/SecurePassword123
+      NEO4J_PLUGINS: '["apoc"]'
+
+    volumes:
+      - neo4j_data:/data
+
+  redis-cache:
+    image: redis:7-alpine
+    container_name: neuronex-redis
+
+    ports:
+      - "6379:6379"
+
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  redis_data:
