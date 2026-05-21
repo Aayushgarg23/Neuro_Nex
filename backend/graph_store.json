@@ -1,0 +1,91 @@
+{
+  "nodes": {
+    "compound_a": {
+      "id": "compound_a",
+      "label": "Compound_A",
+      "type": "Drug",
+      "properties": {
+        "mw": 342.4,
+        "logP": 2.1
+      }
+    },
+    "receptor_z": {
+      "id": "receptor_z",
+      "label": "Receptor_Z",
+      "type": "Protein",
+      "properties": {
+        "uniprot": "Q9Y6R0"
+      }
+    },
+    "pathway_y": {
+      "id": "pathway_y",
+      "label": "Pathway_Y",
+      "type": "Pathway",
+      "properties": {
+        "kegg": "hsa04151"
+      }
+    },
+    "disease_c": {
+      "id": "disease_c",
+      "label": "Disease_C",
+      "type": "Disease",
+      "properties": {
+        "omim": "114480"
+      }
+    },
+    "gene_mapk": {
+      "id": "gene_mapk",
+      "label": "MAPK/ERK",
+      "type": "Gene",
+      "properties": {
+        "entrez": "5594"
+      }
+    },
+    "compound_b": {
+      "id": "compound_b",
+      "label": "Imatinib",
+      "type": "Drug",
+      "properties": {
+        "approved": true
+      }
+    }
+  },
+  "edges": [
+    {
+      "source": "compound_a",
+      "target": "receptor_z",
+      "type": "ACTIVATES",
+      "confidence": 0.92
+    },
+    {
+      "source": "receptor_z",
+      "target": "pathway_y",
+      "type": "TRIGGERS",
+      "confidence": 0.88
+    },
+    {
+      "source": "pathway_y",
+      "target": "disease_c",
+      "type": "LINKED_TO",
+      "confidence": 0.75
+    },
+    {
+      "source": "gene_mapk",
+      "target": "pathway_y",
+      "type": "REGULATES",
+      "confidence": 0.95
+    },
+    {
+      "source": "compound_a",
+      "target": "compound_b",
+      "type": "SIMILAR_TO",
+      "confidence": 0.78
+    },
+    {
+      "source": "compound_b",
+      "target": "disease_c",
+      "type": "CONTRADICTS",
+      "confidence": 0.61
+    }
+  ]
+}
