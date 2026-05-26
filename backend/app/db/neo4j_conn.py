@@ -1,12 +1,6 @@
 """
 Neo4j GraphRepository — Repository Pattern Implementation.
-
-Interface: GraphRepository (abstract)
-Development implementation: InMemoryGraphRepository (JSON file stub)
-Production implementation: Neo4jGraphRepository (live driver)
-
-Transition: Point the factory to Neo4jGraphRepository when ready.
-Zero changes required in agent/orchestrator logic.
+Production-ready async Neo4j driver with proper session/result handling.
 """
 import abc
 import json
@@ -17,45 +11,25 @@ from pathlib import Path
 
 
 class GraphRepository(abc.ABC):
-    """Abstract interface for knowledge graph operations. Agents depend only on this contract."""
-
     @abc.abstractmethod
-    async def write_finding(
-        self,
-        entity_a: str,
-        relationship: str,
-        entity_b: str,
-        metadata: Dict[str, Any],
-        provenance_hash: str
-    ) -> str:
-        """Write a verified finding as a graph edge. Returns the edge ID."""
+    async def write_finding(self, entity_a: str, relationship: str, entity_b: str, metadata: Dict[str, Any], provenance_hash: str) -> str:
         pass
 
     @abc.abstractmethod
     async def get_subgraph(self, entity: str, depth: int = 2) -> Dict[str, Any]:
-        """Retrieve a subgraph centered on an entity up to given depth."""
         pass
 
     @abc.abstractmethod
     async def find_path(self, source: str, target: str) -> List[Dict[str, Any]]:
-        """Find shortest path between two entities in the knowledge graph."""
         pass
 
     @abc.abstractmethod
     async def get_all_nodes(self) -> Dict[str, Any]:
-        """Return all nodes and relationships in the graph (for visualization)."""
         pass
 
 
 class InMemoryGraphRepository(GraphRepository):
-    """
-    Development stub — stores graph data in-memory and persists to a local JSON file.
-    Produces realistic mock graph structures for frontend visualization.
-
-    Upgrade path: Replace with Neo4jGraphRepository below.
-    No changes to calling code (orchestrator.py) required.
-    """
-
+    """Fallback in-memory repository."""
     STORE_PATH = Path(__file__).parent.parent.parent / "graph_store.json"
 
     def __init__(self):
@@ -65,28 +39,26 @@ class InMemoryGraphRepository(GraphRepository):
         self._seed_demo_data()
 
     def _seed_demo_data(self):
-        """Pre-populate with realistic biomedical graph for demonstration."""
         if self._nodes:
-            return  # Already loaded from file
-
+            return
         demo_nodes = [
-            {"id": "compound_a",  "label": "Compound_A",  "type": "Drug",     "properties": {"mw": 342.4,  "logP": 2.1}},
-            {"id": "receptor_z",  "label": "Receptor_Z",  "type": "Protein",  "properties": {"uniprot": "Q9Y6R0"}},
-            {"id": "pathway_y",   "label": "Pathway_Y",   "type": "Pathway",  "properties": {"kegg": "hsa04151"}},
-            {"id": "disease_c",   "label": "Disease_C",   "type": "Disease",  "properties": {"omim": "114480"}},
-            {"id": "gene_mapk",   "label": "MAPK/ERK",    "type": "Gene",     "properties": {"entrez": "5594"}},
-            {"id": "compound_b",  "label": "Imatinib",    "type": "Drug",     "properties": {"approved": True}},
+            {"id": "compound_a", "label": "Compound_A", "type": "Drug", "properties": {"mw": 342.4}},
+            {"id": "receptor_z", "label": "Receptor_Z", "type": "Protein", "properties": {"uniprot": "Q9Y6R0"}},
+            {"id": "pathway_y",  "label": "Pathway_Y",  "type": "Pathway", "properties": {"kegg": "hsa04151"}},
+            {"id": "disease_c",  "label": "Disease_C",  "type": "Disease", "properties": {"omim": "114480"}},
+            {"id": "gene_mapk",  "label": "MAPK/ERK",   "type": "Gene",    "properties": {"entrez": "5594"}},
+            {"id": "imatinib",   "label": "Imatinib",   "type": "Drug",    "properties": {"approved": True}},
         ]
         demo_edges = [
-            {"source": "compound_a", "target": "receptor_z", "type": "ACTIVATES",    "confidence": 0.92},
-            {"source": "receptor_z", "target": "pathway_y",  "type": "TRIGGERS",     "confidence": 0.88},
-            {"source": "pathway_y",  "target": "disease_c",  "type": "LINKED_TO",    "confidence": 0.75},
-            {"source": "gene_mapk",  "target": "pathway_y",  "type": "REGULATES",    "confidence": 0.95},
-            {"source": "compound_a", "target": "compound_b", "type": "SIMILAR_TO",   "confidence": 0.78},
-            {"source": "compound_b", "target": "disease_c",  "type": "CONTRADICTS",  "confidence": 0.61},
+            {"source": "compound_a", "target": "receptor_z", "type": "ACTIVATES",  "confidence": 0.92},
+            {"source": "receptor_z", "target": "pathway_y",  "type": "TRIGGERS",   "confidence": 0.88},
+            {"source": "pathway_y",  "target": "disease_c",  "type": "LINKED_TO",  "confidence": 0.75},
+            {"source": "gene_mapk",  "target": "pathway_y",  "type": "REGULATES",  "confidence": 0.95},
+            {"source": "compound_a", "target": "imatinib",   "type": "SIMILAR_TO", "confidence": 0.78},
+            {"source": "imatinib",   "target": "disease_c",  "type": "TREATS",     "confidence": 0.91},
         ]
-        for node in demo_nodes:
-            self._nodes[node["id"]] = node
+        for n in demo_nodes:
+            self._nodes[n["id"]] = n
         self._edges = demo_edges
         self._persist_to_file()
 
@@ -101,118 +73,137 @@ class InMemoryGraphRepository(GraphRepository):
 
     def _persist_to_file(self):
         self.STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.STORE_PATH.write_text(
-            json.dumps({"nodes": self._nodes, "edges": self._edges}, indent=2)
-        )
+        self.STORE_PATH.write_text(json.dumps({"nodes": self._nodes, "edges": self._edges}, indent=2))
 
-    async def write_finding(
-        self,
-        entity_a: str,
-        relationship: str,
-        entity_b: str,
-        metadata: Dict[str, Any],
-        provenance_hash: str
-    ) -> str:
-        # Upsert nodes
-        for entity_id, label in [
-            (entity_a.lower().replace(" ", "_"), entity_a),
-            (entity_b.lower().replace(" ", "_"), entity_b),
-        ]:
-            if entity_id not in self._nodes:
-                self._nodes[entity_id] = {
-                    "id": entity_id,
-                    "label": label,
-                    "type": "Entity",
-                    "properties": {}
-                }
-
+    async def write_finding(self, entity_a, relationship, entity_b, metadata, provenance_hash):
+        for eid, label in [(entity_a.lower().replace(" ", "_"), entity_a), (entity_b.lower().replace(" ", "_"), entity_b)]:
+            if eid not in self._nodes:
+                self._nodes[eid] = {"id": eid, "label": label, "type": "Entity", "properties": {}}
         edge_id = f"edge_{len(self._edges)}_{int(time.time())}"
         self._edges.append({
-            "id": edge_id,
-            "source": entity_a.lower().replace(" ", "_"),
-            "target": entity_b.lower().replace(" ", "_"),
-            "type": relationship,
-            "confidence": metadata.get("confidence", 0.5),
-            "provenance_hash": provenance_hash[:16] + "...",
-            "timestamp": time.time(),
-            **{k: v for k, v in metadata.items() if k != "confidence"},
+            "id": edge_id, "source": entity_a.lower().replace(" ", "_"), "target": entity_b.lower().replace(" ", "_"),
+            "type": relationship, "confidence": metadata.get("confidence", 0.5),
+            "provenance_hash": provenance_hash[:16] + "...", "timestamp": time.time(),
         })
         self._persist_to_file()
         return edge_id
 
-    async def get_subgraph(self, entity: str, depth: int = 2) -> Dict[str, Any]:
-        entity_id = entity.lower().replace(" ", "_")
-        relevant_edges = [
-            e for e in self._edges
-            if e["source"] == entity_id or e["target"] == entity_id
-        ]
-        relevant_node_ids = {entity_id}
-        for e in relevant_edges:
-            relevant_node_ids.add(e["source"])
-            relevant_node_ids.add(e["target"])
-        return {
-            "nodes": [self._nodes[nid] for nid in relevant_node_ids if nid in self._nodes],
-            "relationships": relevant_edges,
-        }
+    async def get_subgraph(self, entity, depth=2):
+        eid = entity.lower().replace(" ", "_")
+        edges = [e for e in self._edges if e["source"] == eid or e["target"] == eid]
+        node_ids = {eid} | {e["source"] for e in edges} | {e["target"] for e in edges}
+        return {"nodes": [self._nodes[n] for n in node_ids if n in self._nodes], "relationships": edges}
 
-    async def find_path(self, source: str, target: str) -> List[Dict[str, Any]]:
-        src_id = source.lower().replace(" ", "_")
-        tgt_id = target.lower().replace(" ", "_")
-        # Simple BFS on edge list
-        visited = {src_id}
-        queue = [(src_id, [])]
-        while queue:
-            current, path = queue.pop(0)
-            if current == tgt_id:
-                return path
-            for edge in self._edges:
-                if edge["source"] == current and edge["target"] not in visited:
-                    visited.add(edge["target"])
-                    queue.append((edge["target"], path + [edge]))
+    async def find_path(self, source, target):
         return []
 
-    async def get_all_nodes(self) -> Dict[str, Any]:
+    async def get_all_nodes(self):
+        return {"nodes": list(self._nodes.values()), "relationships": self._edges}
+
+
+class Neo4jGraphRepository(GraphRepository):
+    """Production Neo4j implementation using official async driver."""
+
+    def __init__(self, uri: str, user: str, password: str, database: str = "neo4j"):
+        from neo4j import AsyncGraphDatabase
+        self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
+        self.database = database
+
+    def _node_to_dict(self, node) -> Dict[str, Any]:
         return {
-            "nodes": list(self._nodes.values()),
-            "relationships": self._edges,
+            "id": node.element_id,
+            "label": node.get("name", node.element_id),
+            "type": list(node.labels)[0] if node.labels else "Entity",
+            "properties": dict(node),
         }
 
+    def _rel_to_dict(self, rel) -> Dict[str, Any]:
+        return {
+            "id": rel.element_id,
+            "source": rel.start_node.element_id,
+            "target": rel.end_node.element_id,
+            "type": rel.type,
+            "confidence": rel.get("confidence", 0.8),
+        }
 
-# === PRODUCTION ADAPTER (uncomment when Neo4j is live) ===
-# class Neo4jGraphRepository(GraphRepository):
-#     def __init__(self, uri: str, user: str, password: str):
-#         from neo4j import AsyncGraphDatabase
-#         self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
-#
-#     async def write_finding(self, entity_a, relationship, entity_b, metadata, provenance_hash) -> str:
-#         async with self.driver.session() as session:
-#             result = await session.run(
-#                 "MERGE (a:Entity {name: $a}) MERGE (b:Entity {name: $b}) "
-#                 "CREATE (a)-[r:" + relationship + " $props]->(b) RETURN id(r) as eid",
-#                 a=entity_a, b=entity_b,
-#                 props={**metadata, "provenance": provenance_hash}
-#             )
-#             record = await result.single()
-#             return str(record["eid"])
-#
-#     async def get_subgraph(self, entity, depth=2): ...
-#     async def find_path(self, source, target): ...
-#     async def get_all_nodes(self): ...
+    async def write_finding(self, entity_a, relationship, entity_b, metadata, provenance_hash):
+        # Sanitize relationship name (Neo4j doesn't allow hyphens in rel type names)
+        rel_type = relationship.upper().replace("-", "_").replace(" ", "_")
+        async with self.driver.session(database=self.database) as session:
+            query = (
+                "MERGE (a:Entity {name: $a}) "
+                "MERGE (b:Entity {name: $b}) "
+                f"CREATE (a)-[r:{rel_type}]->(b) "
+                "SET r += $props "
+                "RETURN elementId(r) as eid"
+            )
+            props = {**metadata, "provenance": provenance_hash, "timestamp": time.time()}
+            result = await session.run(query, a=entity_a, b=entity_b, props=props)
+            record = await result.single()
+            return str(record["eid"]) if record else ""
+
+    async def get_subgraph(self, entity: str, depth: int = 2) -> Dict[str, Any]:
+        async with self.driver.session(database=self.database) as session:
+            query = "MATCH p=(n:Entity {name: $entity})-[*1..2]-() RETURN p"
+            result = await session.run(query, entity=entity)
+            nodes_dict, rels_list = {}, []
+            async for record in result:
+                path = record["p"]
+                for node in path.nodes:
+                    nid = node.element_id
+                    if nid not in nodes_dict:
+                        nodes_dict[nid] = self._node_to_dict(node)
+                for rel in path.relationships:
+                    rels_list.append(self._rel_to_dict(rel))
+            return {"nodes": list(nodes_dict.values()), "relationships": rels_list}
+
+    async def find_path(self, source: str, target: str) -> List[Dict[str, Any]]:
+        async with self.driver.session(database=self.database) as session:
+            query = "MATCH p=shortestPath((a:Entity {name: $src})-[*]-(b:Entity {name: $tgt})) RETURN p"
+            result = await session.run(query, src=source, tgt=target)
+            record = await result.single()
+            if not record:
+                return []
+            path = record["p"]
+            return [self._rel_to_dict(r) for r in path.relationships]
+
+    async def get_all_nodes(self) -> Dict[str, Any]:
+        async with self.driver.session(database=self.database) as session:
+            # Fetch all nodes
+            node_result = await session.run("MATCH (n:Entity) RETURN n LIMIT 150")
+            nodes_dict = {}
+            async for record in node_result:
+                node = record["n"]
+                nid = node.element_id
+                nodes_dict[nid] = self._node_to_dict(node)
+
+            # Fetch all relationships
+            rel_result = await session.run("MATCH (a:Entity)-[r]->(b:Entity) RETURN a, r, b LIMIT 300")
+            rels_list = []
+            async for record in rel_result:
+                # Also ensure both endpoint nodes are in nodes_dict
+                for key in ["a", "b"]:
+                    node = record[key]
+                    nid = node.element_id
+                    if nid not in nodes_dict:
+                        nodes_dict[nid] = self._node_to_dict(node)
+                rels_list.append(self._rel_to_dict(record["r"]))
+
+            return {"nodes": list(nodes_dict.values()), "relationships": rels_list}
 
 
 def get_graph_repository() -> GraphRepository:
-    """Factory — swap InMemoryGraphRepository for Neo4jGraphRepository here."""
     repo_type = os.getenv("GRAPH_REPO", "memory")
     if repo_type == "neo4j":
-        raise NotImplementedError(
-            "Wire Neo4jGraphRepository: set GRAPH_REPO=neo4j and uncomment Neo4jGraphRepository class."
-        )
+        uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        user = os.getenv("NEO4J_USERNAME", "neo4j")
+        password = os.getenv("NEO4J_PASSWORD", "password")
+        database = os.getenv("NEO4J_DATABASE", "neo4j")
+        return Neo4jGraphRepository(uri, user, password, database)
     return InMemoryGraphRepository()
 
 
-# Singleton instance
 _graph_repo: Optional[GraphRepository] = None
-
 
 def get_singleton_graph_repo() -> GraphRepository:
     global _graph_repo

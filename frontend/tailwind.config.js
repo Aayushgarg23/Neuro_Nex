@@ -1,6 +1,7 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  darkMode: 'class',
   theme: {
     extend: {
       fontFamily: {
@@ -10,42 +11,45 @@ export default {
       },
       colors: {
         brand: {
-          50: '#f0fdf9',
-          100: '#ccfbef',
-          400: '#2dd4bf',
-          500: '#00D4AA',
-          600: '#00b896',
-          700: '#00967a',
+          50: '#E8F0FE',
+          100: '#D2E3FC',
+          200: '#AECBFA',
+          300: '#8AB4F8',
+          400: '#669DF6',
+          500: '#1A73E8', // Google Blue
+          600: '#1967D2',
+          700: '#185ABC',
+          800: '#174EA6',
+          900: '#123D82',
         },
-        violet: {
-          400: '#a78bfa',
-          500: '#8b5cf6',
-          600: '#7c3aed',
+        success: {
+          500: '#1E8E3E', // Google Green
         },
+        warning: {
+          500: '#F9AB00', // Google Yellow
+        },
+        danger: {
+          500: '#D93025', // Google Red
+        }
       },
       animation: {
-        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-        'glow': 'glow 2s ease-in-out infinite alternate',
-        'float': 'float 6s ease-in-out infinite',
-        'scan': 'scan 3s linear infinite',
+        'count-up': 'countUp 0.6s ease-out forwards',
+        'fill-bar': 'fillBar 1.2s cubic-bezier(0.34, 1.56, 0.64, 1) forwards',
       },
       keyframes: {
-        glow: {
-          from: { boxShadow: '0 0 10px #00D4AA33' },
-          to: { boxShadow: '0 0 25px #00D4AA66, 0 0 50px #00D4AA22' },
+        countUp: {
+          from: { opacity: 0, transform: 'translateY(10px)' },
+          to: { opacity: 1, transform: 'translateY(0)' },
         },
-        float: {
-          '0%, 100%': { transform: 'translateY(0px)' },
-          '50%': { transform: 'translateY(-8px)' },
-        },
-        scan: {
-          '0%': { transform: 'translateY(-100%)' },
-          '100%': { transform: 'translateY(400%)' },
+        fillBar: {
+          from: { width: 0 },
+          to: { width: 'var(--target-width)' },
         },
       },
-      backdropBlur: {
-        xs: '2px',
-      },
+      boxShadow: {
+        'card': '0 1px 2px 0 rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15)',
+        'card-hover': '0 1px 3px 0 rgba(60,64,67,0.3), 0 4px 8px 3px rgba(60,64,67,0.15)',
+      }
     },
   },
   plugins: [],

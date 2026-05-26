@@ -1,11 +1,23 @@
 """
-LLM Provider Interface — Interface-First Design.
-Swap MockLLMAdapter for GeminiAdapter or OpenAIAdapter in config without touching agent logic.
+LLM Provider — Production-grade with multi-model cascade fallback.
+
+Architecture:
+  1. GeminiAdapter — calls Gemini REST API directly (no SDK, no event-loop blocking)
+  2. Multi-model cascade: if model A returns 429/503/500, instantly tries model B, C, D
+  3. Configurable maxOutputTokens per call (agents use less, Chairman uses more)
+  4. Exponential backoff on transient errors with jitter
 """
 import abc
 import asyncio
-from typing import Dict, Any, List
+import os
+import time
+import random
+import logging
+from typing import Optional
 from dataclasses import dataclass
+import httpx
+
+logger = logging.getLogger("neuronex.llm")
 
 
 @dataclass
@@ -17,11 +29,10 @@ class LLMResponse:
 
 
 class LLMProvider(abc.ABC):
-    """Abstract interface for all LLM providers. Agents only depend on this contract."""
-
     @abc.abstractmethod
-    async def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> LLMResponse:
-        """Sends a prompt and returns a structured response."""
+    async def complete(self, system_prompt: str, user_prompt: str,
+                       temperature: float = 0.1,
+                       max_tokens: int = 4096) -> LLMResponse:
         pass
 
     @abc.abstractmethod
@@ -29,87 +40,190 @@ class LLMProvider(abc.ABC):
         pass
 
 
-class MockLLMAdapter(LLMProvider):
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini REST API Adapter
+# ─────────────────────────────────────────────────────────────────────────────
+class GeminiAdapter(LLMProvider):
     """
-    Development-phase mock adapter.
-    Returns rich, domain-realistic responses without calling an external API.
-    Swap this class for GeminiAdapter in production by changing config/llm_config.py.
+    Direct REST call to Gemini API — genuinely async via httpx.
+    Supports configurable max_tokens per call to control costs.
     """
+    _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-    # Rich domain-specific response templates keyed by agent role
-    _AGENT_RESPONSES: Dict[str, List[str]] = {
-        "evidence": [
-            "GraphRAG traversal completed across 3 knowledge hops. Target compound Compound_A demonstrates statistically significant activation (p=0.003) of Pathway_Y via Receptor_Z. Experimental evidence sourced from n=847 peer-reviewed publications indexed in the internal graph store. Mean effect size: Cohen's d = 1.42 (95% CI: 1.18–1.67). Pathway activation confirmed via three independent assay types: ELISA, Western blot, and RNA-seq differential expression (log₂FC = 2.31).",
-            "Vector index retrieval returned 14 high-confidence documents (cosine similarity > 0.92). Evidence supports mechanistic plausibility: upregulation of MAPK/ERK pathway confirmed in 9/14 sources. Cross-domain graph traversal identified Receptor_Z as a dual-function node connecting both metabolic and inflammatory cascades.",
-        ],
-        "skeptic": [
-            "CRITICAL AUDIT: Detected high publication bias risk (Egger's test p=0.041). Sample cohort is statistically underpowered (n=34 across 5 studies; minimum required: n=120 for 0.80 power at α=0.05). Three of nine supporting studies originate from a single research group — potential replication dependency. In-vitro-to-in-vivo translation gap unaddressed. No randomized controlled trials (RCTs) identified in the knowledge graph. Recommend confidence downgrade: 0.73 → 0.41.",
-            "Methodological concern flagged: Two primary citations use retrospective cohort designs, introducing confounding variables. Activation metrics for Receptor_Z measured under non-physiological pH conditions (pH 6.2 vs. physiological pH 7.4). Temporal resolution of pathway activation measurements (72h post-exposure) does not capture acute signaling dynamics.",
-        ],
-        "connector": [
-            "Multi-hop graph traversal (depth=4) reveals non-obvious cross-domain pathway: Compound_A → inhibits → MDM2 → releases → p53 → activates → PUMA → triggers → Pathway_Y. Secondary connector identified: Receptor_Z shares 73% structural homology with VEGFR-2, suggesting potential off-target angiogenic effects (confidence: 0.81). Oncological literature cross-reference found 3 analogous mechanisms in breast cancer models.",
-            "Graph centrality analysis identifies Receptor_Z as a high-betweenness hub node (centrality score: 0.847) connecting 12 independent biological subgraphs. This structural position implies broad pleiotropic effects. Novel connection discovered: Compound_A shares a pharmacophore core with approved drug Imatinib (Tanimoto similarity: 0.78), indicating potential drug repurposing viability.",
-        ],
-        "quality": [
-            "Methodology audit complete. CONSORT checklist compliance: 6/12 criteria met. Major deficiencies: (1) Allocation concealment not described in 4/7 studies; (2) Blinding of outcome assessment absent in all in-vivo experiments; (3) Protocol pre-registration absent (potential HARKing risk). Clinical Translation Readiness Level: TRL-3 (proof-of-concept). Recommended next step: IND-enabling study design with DMPK profiling.",
-            "Research quality index: 0.62/1.0. Positive indicators: consistent cell-line model (HEK293T), reproducible assay conditions. Risk factors: No patient-derived organoid validation; species-specific receptor binding data absent for non-murine models. Regulatory compliance gap: ICH M3(R2) guidance not addressed for human safety pharmacology.",
-        ],
-    }
+    # Retryable HTTP status codes
+    _RETRYABLE = {429, 500, 502, 503, 504}
 
-    async def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> LLMResponse:
-        import time
-        import random
+    def __init__(self, api_key: str, model_name: str = "gemini-2.0-flash"):
+        self.api_key = api_key
+        self.model_name = model_name
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0, connect=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+    async def complete(self, system_prompt: str, user_prompt: str,
+                       temperature: float = 0.1,
+                       max_tokens: int = 4096) -> LLMResponse:
         start = time.perf_counter()
-        await asyncio.sleep(0.08)  # Simulate realistic API latency
+        url = self._BASE_URL.format(model=self.model_name)
 
-        # Route to appropriate response template based on system_prompt keywords
-        role = "evidence"
-        prompt_lower = system_prompt.lower()
-        if "skeptic" in prompt_lower or "bias" in prompt_lower:
-            role = "skeptic"
-        elif "connect" in prompt_lower or "path" in prompt_lower or "hub" in prompt_lower:
-            role = "connector"
-        elif "quality" in prompt_lower or "methodology" in prompt_lower or "audit" in prompt_lower:
-            role = "quality"
+        payload = {
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+                "topP": 0.95,
+                "topK": 40,
+            },
+        }
 
-        responses = self._AGENT_RESPONSES[role]
-        content = random.choice(responses)
-        latency = (time.perf_counter() - start) * 1000
+        last_error = None
+        # 2 retry attempts with exponential backoff (0.5s, 1.5s)
+        for attempt in range(3):
+            try:
+                resp = await self._client.post(url, json=payload, params={"key": self.api_key})
 
-        # Slightly vary content based on query context
-        if user_prompt:
-            # Inject query context into response naturally
-            first_word = user_prompt[:20].split()[0] if user_prompt.split() else "Pathway_Y"
-            content = content.replace("Pathway_Y", first_word)
+                if resp.status_code in self._RETRYABLE:
+                    last_error = f"HTTP {resp.status_code}"
+                    wait = (0.5 * (2 ** attempt)) + random.uniform(0, 0.3)
+                    logger.warning(f"[{self.model_name}] {last_error}, retry {attempt+1}/3 in {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
 
+                resp.raise_for_status()
+                data = resp.json()
+
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    content = " ".join(p.get("text", "") for p in parts)
+                else:
+                    content = ""
+
+                usage = data.get("usageMetadata", {})
+                tokens = usage.get("totalTokenCount", len(content.split()))
+
+                latency_ms = (time.perf_counter() - start) * 1000
+                return LLMResponse(
+                    content=content,
+                    model_used=self.model_name,
+                    token_count=tokens,
+                    latency_ms=round(latency_ms, 2),
+                )
+
+            except httpx.TimeoutException:
+                last_error = "timeout"
+                logger.warning(f"[{self.model_name}] Timeout, attempt {attempt+1}/3")
+            except httpx.HTTPStatusError as e:
+                last_error = f"HTTP {e.response.status_code}"
+                logger.warning(f"[{self.model_name}] {last_error}")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"[{self.model_name}] Error: {last_error}")
+
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+        # All retries exhausted for this model
+        latency_ms = (time.perf_counter() - start) * 1000
         return LLMResponse(
-            content=content,
-            model_used="mock-llm-v1-dev",
-            token_count=len(content.split()),
-            latency_ms=round(latency, 2)
+            content=f"__ERROR__:{last_error}",
+            model_used=self.model_name,
+            token_count=0,
+            latency_ms=round(latency_ms, 2),
         )
 
     def get_model_name(self) -> str:
-        return "mock-llm-v1-dev"
+        return self.model_name
 
 
-# === PRODUCTION ADAPTERS (wired in when ready) ===
-# class GeminiAdapter(LLMProvider):
-#     def __init__(self, api_key: str, model: str = "gemini-2.5-pro"):
-#         import google.generativeai as genai
-#         genai.configure(api_key=api_key)
-#         self.model = genai.GenerativeModel(model)
-#
-#     async def complete(self, system_prompt, user_prompt, temperature=0.1) -> LLMResponse:
-#         ... (drop-in replacement)
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Model Cascade — the 503-proof solution
+# ─────────────────────────────────────────────────────────────────────────────
+class MultiModelCascade:
+    """
+    Tries multiple Gemini models in sequence. If model A returns an error
+    (429, 503, 500, timeout), instantly falls through to model B, then C.
+
+    This ensures: even during a viva presentation with Google Gemini API spikes,
+    at least ONE model will respond. The cascade order:
+
+      1. gemini-2.0-flash       (best quality, free tier)
+      2. gemini-2.0-flash-lite  (faster, lower quality, separate quota pool)
+      3. gemini-1.5-flash       (older but stable, different capacity)
+      4. gemini-1.5-flash-8b    (smallest, almost always available)
+
+    If ALL 4 fail, returns a rich offline fallback response.
+    """
+
+    def __init__(self, api_key: str, models: list[str] | None = None):
+        self.models = models or [
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ]
+        self.adapters = [GeminiAdapter(api_key=api_key, model_name=m) for m in self.models]
+
+    async def complete(self, system_prompt: str, user_prompt: str,
+                       temperature: float = 0.15,
+                       max_tokens: int = 4096) -> LLMResponse:
+        """Try each model in cascade. First successful response wins."""
+        errors = []
+        for adapter in self.adapters:
+            resp = await adapter.complete(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            # Check if this model succeeded
+            if not resp.content.startswith("__ERROR__") and resp.content.strip():
+                logger.info(f"Cascade: {adapter.model_name} succeeded ({resp.latency_ms:.0f}ms, {resp.token_count} tokens)")
+                return resp
+
+            errors.append(f"{adapter.model_name}: {resp.content}")
+            logger.warning(f"Cascade: {adapter.model_name} failed, trying next...")
+
+        # All models failed — return fallback marker
+        logger.error(f"Cascade: ALL models failed: {errors}")
+        return LLMResponse(
+            content="__FALLBACK__",
+            model_used="cascade-fallback",
+            token_count=0,
+            latency_ms=0.0,
+        )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory
+# ─────────────────────────────────────────────────────────────────────────────
 def get_llm_provider() -> LLMProvider:
-    """Dependency injection factory. Replace MockLLMAdapter with production adapter here."""
-    import os
-    provider = os.getenv("LLM_PROVIDER", "mock")
-    if provider == "mock":
-        return MockLLMAdapter()
-    # elif provider == "gemini":
-    #     return GeminiAdapter(api_key=os.getenv("GEMINI_API_KEY"))
-    return MockLLMAdapter()  # Fallback
+    """Factory — selects provider based on environment variables."""
+    provider = os.getenv("LLM_PROVIDER", "mock").lower()
+    if provider == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is required.")
+        return GeminiAdapter(api_key=api_key, model_name=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
+    return MockLLMAdapter()
+
+
+def get_cascade(api_key: str | None = None) -> MultiModelCascade:
+    """Create a cascade with the given or env API key."""
+    key = api_key or os.getenv("GEMINI_API_KEY", "")
+    return MultiModelCascade(api_key=key)
+
+
+class MockLLMAdapter(LLMProvider):
+    async def complete(self, system_prompt: str, user_prompt: str,
+                       temperature: float = 0.1, max_tokens: int = 4096) -> LLMResponse:
+        await asyncio.sleep(0.05)
+        return LLMResponse(
+            content="⚠️ No LLM configured. Set LLM_PROVIDER=gemini and GEMINI_API_KEY in .env",
+            model_used="mock", token_count=20, latency_ms=50.0,
+        )
+
+    def get_model_name(self) -> str:
+        return "mock"

@@ -59,16 +59,24 @@ class VerificationReport(BaseModel):
     tokens: int = Field(default=0)
 
 
+def _merge_dicts(x: Dict, y: Dict) -> Dict:
+    """Reducer: merge two dicts — used for concurrent council_reviews updates."""
+    return {**x, **y}
+
+
 class AgentState(BaseModel):
+    # messages: append-only list (built-in operator.add)
     messages: Annotated[list, operator.add] = Field(default_factory=list)
     query: str = Field(default="")
     thread_id: str = Field(default="")
-    council_reviews: Dict = Field(default_factory=dict)
+    # council_reviews: 4 agents write concurrently → merge dicts
+    council_reviews: Annotated[Dict, _merge_dicts] = Field(default_factory=dict)
     peer_evaluations_compiled: Dict = Field(default_factory=dict)
     final_report: Dict[str, Any] = Field(default_factory=dict)
     calibrated_score: float = Field(default=0.0)
     ibct_chain_summary: List[Dict] = Field(default_factory=list)
-    amro_routing_log: List[Dict] = Field(default_factory=list)
+    # amro_routing_log: 4 agents append entries concurrently → concat lists
+    amro_routing_log: Annotated[List[Dict], operator.add] = Field(default_factory=list)
     qaoa_schedule: List[Dict] = Field(default_factory=list)
     graph_node_written: str = Field(default="")
 
@@ -153,6 +161,67 @@ skeptic_agent_node   = _build_agent_node("skeptic_agent")
 connector_agent_node = _build_agent_node("connector_agent")
 quality_agent_node   = _build_agent_node("quality_agent")
 
+async def _synthesize_verdict(query: str, council_results: dict, final_score: float) -> tuple:
+    """Calls Gemini dynamically to synthesize agent reviews into a custom, domain-specific verdict."""
+    findings_summary = ""
+    for aid, result in council_results.items():
+        # Get findings from either pydantic model (VerificationReport) or dict
+        findings = getattr(result, "findings", "") if hasattr(result, "findings") else result.get("findings", "")
+        disp_name = aid.replace("_", " ").title()
+        findings_summary += f"- {disp_name}: {findings}\n"
+
+    system_prompt = (
+        "You are the Chairman of the NeuroNex Multi-Agent Council. "
+        "Your task is to synthesize the findings of 4 specialized aspect agents into a single, "
+        "cohesive, and definitive consensus verdict that directly answers the user's query.\n\n"
+        "Guidelines:\n"
+        "1. Write a direct, authoritative, and concise 2-3 sentence consensus verdict.\n"
+        "2. Do NOT use meta-language like 'The council agrees' or 'Here is the verdict'. State the conclusion directly.\n"
+        "3. Adapt your tone and vocabulary to the query's domain (e.g. sports, finance, physics, biology, etc.).\n"
+        "4. Address any conflicts or highlights raised by the agents (e.g. data evidence vs skeptic doubts)."
+    )
+
+    user_prompt = (
+        f"User Query: \"{query}\"\n\n"
+        f"Calibrated Score: {final_score * 100:.1f}%\n\n"
+        f"Agent Analysis:\n{findings_summary}\n"
+        "State the final consensus verdict directly:"
+    )
+
+    try:
+        resp = await _llm_provider.complete(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.2,
+        )
+        verdict = resp.content.strip()
+    except Exception as e:
+        if final_score >= 0.8:
+            verdict = f"HIGH CONFIDENCE ({final_score*100:.1f}%): The evidence strongly supports the query parameters."
+        elif final_score >= 0.6:
+            verdict = f"MODERATE CONFIDENCE ({final_score*100:.1f}%): Plausible scenario, but minor contradictions or gaps exist."
+        else:
+            verdict = f"LOW CONFIDENCE ({final_score*100:.1f}%): Insufficient evidence or significant skeptical objections raised."
+
+    # Compute context-aware readiness level
+    is_biomedical = any(k in query.lower() for k in ["pathway", "inhib", "receptor", "disease", "drug", "clinical", "compound", "protein", "gene", "cell", "cancer", "treatment"])
+    if is_biomedical:
+        if final_score >= 0.8:
+            trl = "TRL-4 (Validated in laboratory)"
+        elif final_score >= 0.6:
+            trl = "TRL-3 (Experimental proof-of-concept)"
+        else:
+            trl = "TRL-2 (Technology concept formulated)"
+    else:
+        if final_score >= 0.8:
+            trl = "Strong Consensus (Evidence-Backed)"
+        elif final_score >= 0.6:
+            trl = "Moderate Consensus (Likely/Plausible)"
+        else:
+            trl = "Weak Consensus (Highly Speculative)"
+
+    return verdict, trl
+
 
 # ---------------------------------------------------------------------------
 # Chairman Synthesis Node
@@ -201,16 +270,8 @@ async def synthesis_chairman_node(state: AgentState) -> Dict[str, Any]:
     raw_score = (alpha * e) + (beta * c) - (gamma * s * (1.0 - q))
     final_score = max(0.0, min(1.0, raw_score))
 
-    # --- Verdict mapping ---
-    if final_score >= 0.80:
-        verdict = "HIGH CONFIDENCE: Pathway activation is strongly supported. Clinical investigation recommended."
-        trl_level = "TRL-4 (Technology validated in lab)"
-    elif final_score >= 0.60:
-        verdict = "MODERATE CONFIDENCE: Plausible mechanism, but methodological gaps require follow-up."
-        trl_level = "TRL-3 (Experimental proof-of-concept)"
-    else:
-        verdict = "LOW CONFIDENCE: Insufficient evidence. High clinical translation risk. Further research required."
-        trl_level = "TRL-2 (Technology concept formulated)"
+    # Dynamic LLM Synthesis
+    verdict, trl_level = await _synthesize_verdict(state.query, reviews, final_score)
 
     ibct.append("COUNCIL_SYNTHESIS", {
         "raw_score": raw_score,
@@ -219,19 +280,35 @@ async def synthesis_chairman_node(state: AgentState) -> Dict[str, Any]:
         "adjusted_scores": adjusted_scores,
     })
 
-    # --- Write verified finding to graph repository ---
-    edge_id = await graph_repo.write_finding(
-        entity_a="Compound_A",
-        relationship="ACTIVATES_VIA" if final_score > 0.6 else "WEAK_LINK_TO",
-        entity_b="Pathway_Y",
-        metadata={
-            "confidence": final_score,
-            "verdict": verdict,
-            "query": state.query[:100],
-            "trl": trl_level,
-        },
-        provenance_hash=ibct.latest_hash,
-    )
+    # --- Write verified finding to graph repository (non-blocking fire-and-forget) ---
+    # We do NOT await this — the Neo4j cloud write happens in the background
+    # so it never delays the response to the user.
+    edge_id = f"pending_{state.thread_id[:8]}"
+    async def _background_graph_write():
+        try:
+            # Dynamically extract target entities from general-domain query
+            words = [w.strip("?,.!") for w in state.query.split() if w.lower() not in ["what", "is", "the", "which", "will", "win", "this", "year", "of", "a", "an", "in", "to", "for", "on", "at", "by", "with"]]
+            ent_a = words[0].title() if len(words) > 0 else "QueryEntity"
+            ent_b = words[-1].title() if len(words) > 1 else "ConsensusVerdict"
+            
+            is_biomedical = any(k in state.query.lower() for k in ["pathway", "inhib", "receptor", "disease", "drug", "clinical", "compound"])
+            rel_name = "ACTIVATES_VIA" if is_biomedical else "PREDICTS_WINNER"
+            
+            await graph_repo.write_finding(
+                entity_a=ent_a,
+                relationship=rel_name,
+                entity_b=ent_b,
+                metadata={
+                    "confidence": final_score,
+                    "verdict": verdict[:120],
+                    "query": state.query[:100],
+                    "trl": trl_level,
+                },
+                provenance_hash=ibct.latest_hash,
+            )
+        except Exception:
+            pass  # Graph write failure must never crash the main pipeline
+    asyncio.create_task(_background_graph_write())
 
     ibct.append("GRAPH_WRITEBACK", {
         "edge_id": edge_id,

@@ -43,9 +43,9 @@ export default function ConsensusGauge({ score = 0, size = 200 }) {
   };
 
   const getColor = (p) => {
-    if (p >= 0.8) return '#00D4AA';
-    if (p >= 0.6) return '#F59E0B';
-    return '#EF4444';
+    if (p >= 0.8) return '#1E8E3E'; // Google Green
+    if (p >= 0.6) return '#F9AB00'; // Google Yellow
+    return '#D93025'; // Google Red
   };
 
   const color = getColor(pct);
@@ -54,37 +54,30 @@ export default function ConsensusGauge({ score = 0, size = 200 }) {
   return (
     <div className="flex flex-col items-center">
       <svg width={size} height={size * 0.75} viewBox={`0 0 ${size} ${size}`} className="overflow-visible">
-        <defs>
-          <filter id="gaugeglow">
-            <feGaussianBlur stdDeviation="3" result="blur" />
-            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-          </filter>
-        </defs>
         {/* Background arc */}
         <path d={arcPath(startAngle, startAngle + sweepAngle, r)}
-              fill="none" stroke="#1E293B" strokeWidth={strokeWidth} strokeLinecap="round" />
+              fill="none" className="stroke-slate-200 dark:stroke-slate-700" strokeWidth={strokeWidth} strokeLinecap="round" />
         {/* Progress arc */}
         {pct > 0 && (
           <path d={arcPath(startAngle, currentAngle, r)}
-                fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinecap="round"
-                filter="url(#gaugeglow)" />
+                fill="none" stroke={color} strokeWidth={strokeWidth} strokeLinecap="round" />
         )}
         {/* Needle dot */}
-        <circle cx={needle.x} cy={needle.y} r={5} fill={color} filter="url(#gaugeglow)" />
+        <circle cx={needle.x} cy={needle.y} r={6} fill={color} />
         {/* Center score */}
         <text x={cx} y={cy - 5} textAnchor="middle" fill={color}
               fontSize={size * 0.18} fontWeight="700" fontFamily="JetBrains Mono">
           {(pct * 100).toFixed(1)}%
         </text>
-        <text x={cx} y={cy + size * 0.12} textAnchor="middle" fill="#475569"
+        <text x={cx} y={cy + size * 0.12} textAnchor="middle" className="fill-slate-500 dark:fill-slate-400"
               fontSize={size * 0.065} fontFamily="Inter">
           CONSENSUS SCORE
         </text>
         {/* Grade labels */}
         <text x={polarToCart(startAngle, r + 18).x} y={polarToCart(startAngle, r + 18).y}
-              textAnchor="middle" fill="#EF4444" fontSize={size * 0.055} fontFamily="Inter">LOW</text>
+              textAnchor="middle" fill="#D93025" fontSize={size * 0.055} fontFamily="Inter" fontWeight="600">LOW</text>
         <text x={polarToCart(startAngle + sweepAngle, r + 18).x} y={polarToCart(startAngle + sweepAngle, r + 18).y}
-              textAnchor="middle" fill="#00D4AA" fontSize={size * 0.055} fontFamily="Inter">HIGH</text>
+              textAnchor="middle" fill="#1E8E3E" fontSize={size * 0.055} fontFamily="Inter" fontWeight="600">HIGH</text>
       </svg>
     </div>
   );
