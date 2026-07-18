@@ -20,6 +20,8 @@ postgres_data/
 neo4j_data/
 redis_data/
 .chroma/
+chroma_store/
+graph_store.json
 
 # Operating system and IDE garbage
 .DS_Store

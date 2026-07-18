@@ -5,400 +5,286 @@ import {
   Send, Paperclip, X, FileText, Brain, Plus, Trash2,
   MessageSquare, Sun, Moon, ChevronDown, ChevronRight,
   CheckCircle, AlertTriangle, XCircle, Menu,
-  Upload, Loader2, ArrowLeft, BookOpen, Zap, Home,
+  Upload, Loader2, ArrowLeft, BookOpen, Zap, Home, ExternalLink,
 } from 'lucide-react';
 
 /* ─────────────────────────────────────────
    CONSTANTS
 ───────────────────────────────────────── */
 const AGENTS = {
-  evidence_agent:  { name: 'Evidence Agent',    short: 'Evidence',  emoji: '🔬', color: '#10b981', bg: 'emerald', think: ['Scanning data sources…', 'Cross-referencing records…', 'Extracting key metrics…', 'Building evidence map…'] },
-  skeptic_agent:   { name: 'Skeptic Agent',     short: 'Skeptic',   emoji: '⚔️',  color: '#ef4444', bg: 'red',     think: ['Auditing methodology…', 'Identifying biases…', 'Stress-testing claims…', 'Checking counter-evidence…'] },
-  connector_agent: { name: 'Connector Agent',   short: 'Connector', emoji: '🔗', color: '#6366f1', bg: 'indigo',  think: ['Multi-hop traversal…', 'Finding hidden links…', 'Cross-domain mapping…', 'Building connection graph…'] },
-  quality_agent:   { name: 'Methodology Agent', short: 'Methodology',emoji: '📋', color: '#8b5cf6', bg: 'violet',  think: ['Auditing frameworks…', 'Scoring data quality…', 'Reviewing methodology…', 'Assessing readiness…'] },
+  evidence_agent:  { name: 'Evidence',   emoji: '🔬', color: '#10b981', think: ['Scanning sources…', 'Cross-referencing…', 'Extracting facts…'] },
+  skeptic_agent:   { name: 'Skeptic',    emoji: '⚔️',  color: '#ef4444', think: ['Auditing gaps…', 'Stress-testing…', 'Finding weaknesses…'] },
+  connector_agent: { name: 'Connector',  emoji: '🔗', color: '#6366f1', think: ['Cross-domain scan…', 'Finding links…', 'Mapping patterns…'] },
+  quality_agent:   { name: 'Methodology',emoji: '📋', color: '#8b5cf6', think: ['Scoring quality…', 'Checking methods…', 'Assessing data…'] },
 };
 
-const LS_SESSIONS = 'nnx_sessions_v3';
-const LS_ACTIVE   = 'nnx_active_v3';
+const LS_SESSIONS = 'nnx_sessions_v4';
+const LS_ACTIVE   = 'nnx_active_v4';
 const LS_THEME    = 'nnx_theme';
 
-/* ─────────────────────────────────────────
-   STORAGE HELPERS
-───────────────────────────────────────── */
 const loadSessions = () => { try { return JSON.parse(localStorage.getItem(LS_SESSIONS) || '[]'); } catch { return []; } };
 const saveSessions = (s) => localStorage.setItem(LS_SESSIONS, JSON.stringify(s.slice(0, 40)));
 const genId = () => `s_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-/* ─────────────────────────────────────────
-   SCORE UTILITIES
-───────────────────────────────────────── */
-function scoreColor(s)  { return s >= 0.8 ? '#10b981' : s >= 0.6 ? '#f59e0b' : '#ef4444'; }
-function scoreLabel(s)  { return s >= 0.8 ? 'High Confidence' : s >= 0.6 ? 'Moderate Confidence' : 'Low Confidence'; }
-function ScoreIcon({ s, size = 16 }) {
-  if (s >= 0.8) return <CheckCircle size={size} style={{ color: '#10b981' }} />;
-  if (s >= 0.6) return <AlertTriangle size={size} style={{ color: '#f59e0b' }} />;
-  return <XCircle size={size} style={{ color: '#ef4444' }} />;
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
 }
 
 /* ─────────────────────────────────────────
-   CIRCULAR SCORE RING
+   CITATION TEXT RENDERER
+   Turns [Source: Name, URL] into clickable chips
 ───────────────────────────────────────── */
-function ScoreRing({ score, size = 56 }) {
-  const r = (size / 2) - 5;
-  const circ = 2 * Math.PI * r;
-  const dash = circ * Math.max(0, Math.min(1, score));
-  const cx = size / 2, cy = size / 2;
-  return (
-    <div className="relative flex-shrink-0" style={{ width: size, height: size }}>
-      <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
-        <circle cx={cx} cy={cy} r={r} fill="none" stroke="#e5e7eb" strokeWidth="4" className="dark:stroke-gray-700" />
-        <circle cx={cx} cy={cy} r={r} fill="none" stroke={scoreColor(score)} strokeWidth="4"
-          strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
-          style={{ transition: 'stroke-dasharray 1s ease' }} />
-      </svg>
-      <span className="absolute inset-0 flex items-center justify-center text-[11px] font-black"
-        style={{ color: scoreColor(score) }}>
-        {Math.round(score * 100)}%
-      </span>
-    </div>
-  );
-}
+function CitedText({ text, baseClass = "text-[15px] text-gray-800 dark:text-gray-100 leading-8" }) {
+  if (!text) return null;
+  
+  // First, parse basic markdown (bold, lists, headings)
+  const renderMarkdown = (str) => {
+    return str.split('\n').map((line, idx) => {
+      let content = line.trim();
+      if (!content) return <div key={idx} className="h-2" />;
+      
+      // Headings
+      if (content.startsWith('### ')) {
+        return <h3 key={idx} className="text-lg font-bold mt-6 mb-2 text-gray-900 dark:text-white">{content.replace('### ', '')}</h3>;
+      }
+      if (content.startsWith('## ')) {
+        return <h2 key={idx} className="text-xl font-bold mt-6 mb-2 text-gray-900 dark:text-white">{content.replace('## ', '')}</h2>;
+      }
+      if (content.startsWith('# ')) {
+        return <h1 key={idx} className="text-2xl font-bold mt-6 mb-2 text-gray-900 dark:text-white">{content.replace('# ', '')}</h1>;
+      }
+      
+      // Lists
+      const isListItem = content.startsWith('- ') || content.startsWith('* ');
+      if (isListItem) {
+        content = content.substring(2);
+      }
+      
+      // Bold syntax
+      const parts = content.split(/(\*\*.*?\*\*)/g);
+      const formattedContent = parts.map((p, i) => 
+        p.startsWith('**') && p.endsWith('**') 
+          ? <strong key={i} className="font-semibold text-gray-900 dark:text-white">{p.slice(2, -2)}</strong> 
+          : p
+      );
 
-/* ─────────────────────────────────────────
-   AGENT FULL-VIEW MODAL
-───────────────────────────────────────── */
-function AgentModal({ agentId, data, onClose }) {
-  const meta = AGENTS[agentId] ?? { name: agentId, emoji: '🤖', color: '#6b7280' };
-  const paragraphs = (data?.findings ?? '').split(/\n\n+/).filter(p => p.trim());
-
-  useEffect(() => {
-    const handler = (e) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onClose]);
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-      <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col animate-scale-pop">
-        {/* Header */}
-        <div className="flex items-center gap-3 px-5 py-4 border-b border-gray-100 dark:border-gray-800"
-          style={{ borderLeftWidth: 4, borderLeftColor: meta.color }}>
-          <span className="text-2xl">{meta.emoji}</span>
-          <div className="flex-1 min-w-0">
-            <h2 className="font-black text-base text-gray-900 dark:text-white">{meta.name}</h2>
-            <div className="flex items-center gap-3 mt-0.5">
-              {data?.confidence && (
-                <span className="text-xs font-bold font-mono" style={{ color: meta.color }}>
-                  {(data.confidence * 100).toFixed(1)}% confidence
-                </span>
-              )}
-              {data?.latency_ms && (
-                <span className="text-xs text-gray-400 font-mono">{(data.latency_ms / 1000).toFixed(1)}s</span>
-              )}
-              {data?.tokens && (
-                <span className="text-xs text-gray-400 font-mono">~{data.tokens.toLocaleString()} tokens</span>
-              )}
-              {data?.model_used && (
-                <span className="text-xs text-gray-400 font-mono">{data.model_used}</span>
-              )}
-            </div>
+      if (isListItem) {
+        return (
+          <div key={idx} className="flex gap-2 mb-1.5 ml-2">
+            <span className="text-gray-400 mt-1">•</span>
+            <div className={baseClass} style={{ marginBottom: 0 }}>{formattedContent}</div>
           </div>
-          <button onClick={onClose}
-            className="p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors">
-            <X size={18} />
-          </button>
-        </div>
+        );
+      }
+      return <p key={idx} className={`${baseClass} mb-4`}>{formattedContent}</p>;
+    });
+  };
 
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5">
-          {paragraphs.length > 0 ? (
-            <div className="space-y-4">
-              {paragraphs.map((p, i) => (
-                <p key={i} className="text-sm text-gray-700 dark:text-gray-300 leading-7">{p.trim()}</p>
-              ))}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-500 italic">No detailed analysis available.</p>
-          )}
+  const parts = text.split(/\[Source:\s*([^,\]]+?)(?:,\s*(https?:\/\/[^\]]+))?\]/g);
+  const result = [];
+  let key = 0;
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 3 === 0) {
+      if (!parts[i]) continue;
+      result.push(
+        <div key={key++} className="inline-block w-full">
+          {renderMarkdown(parts[i])}
         </div>
+      );
+    } else if (i % 3 === 1) {
+      const name = parts[i]?.trim() || '';
+      const url  = parts[i + 1]?.trim() || '#';
+      i++;
+      result.push(
+        <a key={key++} href={url} target="_blank" rel="noopener noreferrer"
+          className="inline-flex items-center gap-1 mx-1 px-2 py-0.5 rounded-md text-[11px] font-semibold no-underline transition-all hover:opacity-80"
+          style={{ background: 'rgba(99,102,241,0.1)', color: '#6366f1', border: '1px solid rgba(99,102,241,0.25)', transform: 'translateY(-2px)' }}>
+          <ExternalLink size={9} />
+          {name}
+        </a>
+      );
+    }
+  }
+  return <div>{result}</div>;
+}
 
-        {/* Footer */}
-        <div className="px-5 py-3 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
-          <span className="text-[11px] text-gray-400 font-mono">Full {meta.name} Report</span>
-          <button onClick={onClose}
-            className="px-4 py-2 rounded-xl bg-gray-900 dark:bg-white text-white dark:text-gray-900 text-xs font-semibold hover:bg-gray-700 dark:hover:bg-gray-100 transition-colors">
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
+/* ─────────────────────────────────────────
+   SCORE RING  (small donut chart)
+───────────────────────────────────────── */
+function ScoreRing({ score, size = 52 }) {
+  const r = (size / 2) - 5;
+  const c = 2 * Math.PI * r;
+  const d = c * Math.max(0, Math.min(1, score));
+  const cx = size / 2, cy = size / 2;
+  const col = score >= 0.8 ? '#10b981' : score >= 0.6 ? '#f59e0b' : '#ef4444';
+  return (
+    <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="rgba(0,0,0,0.06)" strokeWidth={4} />
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke={col} strokeWidth={4}
+        strokeDasharray={`${d} ${c}`} strokeLinecap="round"
+        style={{ transition: 'stroke-dasharray 1s ease' }} />
+      <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central"
+        style={{ fontSize: size * 0.22, fontWeight: 800, fill: col, transform: 'rotate(90deg)', transformOrigin: `${cx}px ${cy}px` }}>
+        {Math.round(score * 100)}%
+      </text>
+    </svg>
   );
 }
 
 /* ─────────────────────────────────────────
-   RESULT CARD (inline in chat)
+   RESULT CARD  — the main output card
 ───────────────────────────────────────── */
 function ResultCard({ result }) {
-  const [agOpen, setAgOpen]   = useState(false);  // closed by default
-  const [techOpen, setTechOpen] = useState(false);
-  const [modalAgent, setModalAgent] = useState(null); // agent_id to show in modal
+  const [showAgents, setShowAgents] = useState(false);
+  const [expandedAgent, setExpandedAgent] = useState(null);
 
-  const score    = result.score ?? 0;
-  const verdict  = result.data?.consensus_verdict ?? '';
-  const tier     = result.data?.trl_assessment ?? '';
-  const cal      = result.data?.calibration ?? {};
-  const agents   = result.peer_evaluations_compiled ?? {};
-  const qaoa     = result.qaoa_schedule ?? [];
-  const tm       = result.token_metrics ?? null;
-
-  // Split verdict into paragraphs for readability
-  const verdictParagraphs = verdict.split(/\n\n+/).filter(p => p.trim());
+  const score      = result.score ?? 0;
+  const verdict    = result.data?.consensus_verdict ?? '';
+  const agents     = result.peer_evaluations_compiled ?? {};
+  const ragSources = result.ragSources ?? [];
+  const scoreColor = score >= 0.8 ? '#10b981' : score >= 0.6 ? '#f59e0b' : '#ef4444';
+  const scoreLabel = score >= 0.8 ? 'High Confidence' : score >= 0.6 ? 'Moderate Confidence' : 'Low Confidence';
 
   return (
-    <div className="mt-2 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-hidden bg-white dark:bg-gray-900 shadow-sm animate-fade-up">
+    <div className="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 overflow-hidden shadow-sm">
 
-      {/* ── Top: Score + Tier ── */}
-      <div className="px-5 py-4 border-b border-gray-100 dark:border-gray-800 flex items-center gap-3">
+      {/* ── Header bar ── */}
+      <div className="flex items-center gap-3 px-5 py-4 border-b border-gray-100 dark:border-gray-800"
+           style={{ background: 'linear-gradient(135deg, rgba(99,102,241,0.04), rgba(16,185,129,0.02))' }}>
         <ScoreRing score={score} size={52} />
         <div className="flex-1 min-w-0">
-          <div className="flex flex-wrap items-center gap-2 mb-1">
-            <ScoreIcon s={score} size={15} />
-            <span className="text-xs font-bold uppercase tracking-wide" style={{ color: scoreColor(score) }}>
-              {scoreLabel(score)}
-            </span>
-            {tier && (
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border"
-                style={{ background: 'rgba(99,102,241,0.08)', color: '#6366f1', borderColor: 'rgba(99,102,241,0.3)' }}>
-                {tier}
-              </span>
-            )}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm font-bold" style={{ color: scoreColor }}>{scoreLabel}</span>
+            <span className="text-xs text-gray-400">·  {(score * 100).toFixed(0)}% council consensus</span>
           </div>
-          <p className="text-[11px] text-gray-400 font-mono">
-            α={cal.alpha ?? '—'} · β={cal.beta ?? '—'} · γ={cal.gamma ?? '—'} (per-query calibration)
+          <p className="text-[11px] text-gray-400 mt-0.5">
+            4 AI agents analyzed this query in parallel, grounded in live-fetched knowledge
           </p>
         </div>
-      </div>
-
-      {/* ── Verdict ── */}
-      <div className="px-5 py-4 border-b border-gray-100 dark:border-gray-800">
-        <div className="flex items-center gap-2 mb-3">
-          <Brain size={14} className="text-indigo-500" />
-          <span className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Chairman's Synthesis</span>
-        </div>
-        <div className="space-y-3">
-          {verdictParagraphs.length > 0
-            ? verdictParagraphs.map((p, i) => (
-                <p key={i} className="text-sm text-gray-800 dark:text-gray-100 leading-7">{p.trim()}</p>
-              ))
-            : <p className="text-sm text-gray-500 italic">Verdict not available.</p>
-          }
+        {/* Agent emoji row */}
+        <div className="hidden sm:flex items-center gap-1.5">
+          {Object.values(AGENTS).map((a, i) => (
+            <span key={i} className="text-base" title={a.name}>{a.emoji}</span>
+          ))}
         </div>
       </div>
 
-      {/* ── Agent Analysis ── */}
-      <div>
-        <button onClick={() => setAgOpen(v => !v)}
-          className="w-full flex items-center justify-between px-5 py-3 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors border-b border-gray-100 dark:border-gray-800">
-          <div className="flex items-center gap-2">
-            <BookOpen size={14} className="text-gray-400" />
-            <span className="text-xs font-semibold text-gray-600 dark:text-gray-300">Agent Analysis</span>
-            <div className="flex gap-1">
-              {Object.entries(AGENTS).map(([id, m]) => (
-                <span key={id} className="text-sm opacity-70">{m.emoji}</span>
-              ))}
-            </div>
-          </div>
-          {agOpen ? <ChevronDown size={14} className="text-gray-400" /> : <ChevronRight size={14} className="text-gray-400" />}
-        </button>
+      {/* ── RAG Sources ── */}
+      {ragSources.length > 0 && (
+        <div className="px-5 py-3 border-b border-gray-100 dark:border-gray-800 flex flex-wrap gap-2 items-center">
+          <span className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mr-1">Sources:</span>
+          {ragSources.map((s, i) => (
+            <a key={i} href={s.source_url || '#'} target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium no-underline border transition-colors hover:border-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-400"
+              style={{ background: 'rgba(16,185,129,0.06)', borderColor: 'rgba(16,185,129,0.25)', color: '#059669' }}>
+              <ExternalLink size={9} />
+              {s.source_name || `Source ${i+1}`}
+            </a>
+          ))}
+        </div>
+      )}
 
-        {agOpen && (
-          <div className="divide-y divide-gray-100 dark:divide-gray-800 border-b border-gray-100 dark:border-gray-800">
-            {Object.entries(AGENTS).map(([id, meta]) => {
-              const r = agents[id];
-              if (!r) return null;
-              const paragraphs = (r.findings ?? '').split(/\n\n+/).filter(p => p.trim());
-              return (
-                <div key={id} className="px-5 py-4" style={{ borderLeftWidth: 3, borderLeftColor: meta.color }}>
-                  {/* Agent header */}
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-2">
-                      <span className="text-lg">{meta.emoji}</span>
-                      <div>
-                        <span className="text-sm font-bold text-gray-800 dark:text-gray-100">{meta.name}</span>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          {r.confidence && (
-                            <span className="text-[10px] font-mono font-bold" style={{ color: meta.color }}>
-                              {(r.confidence * 100).toFixed(1)}%
-                            </span>
-                          )}
-                          {r.latency_ms && <span className="text-[10px] text-gray-400 font-mono">{(r.latency_ms/1000).toFixed(1)}s</span>}
-                          {r.tokens && <span className="text-[10px] text-gray-400 font-mono">~{r.tokens.toLocaleString()} tokens</span>}
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => setModalAgent(id)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-indigo-300 hover:text-indigo-600 dark:hover:text-indigo-400 dark:hover:border-indigo-700 transition-colors"
-                    >
-                      <BookOpen size={11} /> Full Report
-                    </button>
-                  </div>
-
-                  {/* Agent summary — first 2 paragraphs */}
-                  <div className="space-y-2">
-                    {paragraphs.slice(0, 2).map((p, i) => (
-                      <p key={i} className="text-sm text-gray-600 dark:text-gray-400 leading-7">{p.trim()}</p>
-                    ))}
-                    {paragraphs.length > 2 && (
-                      <button onClick={() => setModalAgent(id)}
-                        className="text-xs font-semibold mt-1 flex items-center gap-1 transition-colors"
-                        style={{ color: meta.color }}>
-                        Read {paragraphs.length - 2} more paragraphs →
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-            {Object.keys(agents).length === 0 && (
-              <p className="px-5 py-4 text-sm text-gray-400 italic">No agent analysis available.</p>
-            )}
-          </div>
+      {/* ── Research Answer ── */}
+      <div className="px-6 py-5">
+        {verdict ? (
+          <CitedText text={verdict} />
+        ) : (
+          <p className="text-[15px] text-gray-400 italic">No summary generated.</p>
         )}
       </div>
 
-      {/* ── System Diagnostics ── */}
-      <button onClick={() => setTechOpen(v => !v)}
-        className="w-full flex items-center justify-between px-5 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
-        <div className="flex items-center gap-2">
-          <Zap size={13} className="text-amber-400" />
-          <span className="text-xs font-semibold text-gray-400">System Diagnostics</span>
-        </div>
-        {techOpen ? <ChevronDown size={14} className="text-gray-400" /> : <ChevronRight size={14} className="text-gray-400" />}
-      </button>
-
-      {techOpen && (
-        <div className="px-5 pb-5 pt-3 border-t border-gray-100 dark:border-gray-800 space-y-5">
-
-          {/* Calibration */}
-          {Object.keys(cal).length > 0 && (
-            <div>
-              <p className="text-[10px] font-mono text-gray-400 uppercase tracking-widest mb-2">Confidence Calibration (Auto-Tuned)</p>
-              <p className="text-xs text-gray-500 mb-3">The Chairman dynamically adjusts these weights based on your query type to ensure an honest final confidence score.</p>
-              <div className="grid grid-cols-3 gap-2">
-                {[
-                  { label: 'Evidence (α)', val: cal.alpha, desc: 'Weight given to factual evidence' },
-                  { label: 'Connector (β)', val: cal.beta, desc: 'Weight given to cross-domain links' },
-                  { label: 'Skeptic (γ)', val: cal.gamma, desc: 'Penalty from skeptical critique' },
-                ].map((c, i) => (
-                  <div key={i} className="bg-gray-50 dark:bg-gray-800 rounded-xl p-3 text-center" title={c.desc}>
-                    <p className="text-[10px] text-gray-400 font-mono mb-1">{c.label}</p>
-                    <p className="text-base font-black text-gray-800 dark:text-white">{c.val ?? '—'}</p>
-                    <p className="text-[9px] text-gray-400 mt-0.5 leading-tight">{c.desc}</p>
-                  </div>
-                ))}
-              </div>
+      {/* ── Agent Details (collapsible) ── */}
+      {Object.keys(agents).length > 0 && (
+        <div className="border-t border-gray-100 dark:border-gray-800">
+          <button onClick={() => setShowAgents(v => !v)}
+            className="w-full flex items-center justify-between px-5 py-3 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-semibold text-gray-400">View Agent Analysis</span>
+              <span className="text-[10px] text-gray-300 dark:text-gray-600">({Object.keys(agents).length} specialists)</span>
             </div>
-          )}
+            {showAgents
+              ? <ChevronDown size={13} className="text-gray-400" />
+              : <ChevronRight size={13} className="text-gray-400" />}
+          </button>
 
-          {/* QAOA -> Task Queue */}
-          {qaoa.length > 0 && (
-            <div>
-              <p className="text-[10px] font-mono text-gray-400 uppercase tracking-widest mb-2">Internal Agent Task Queue</p>
-              <p className="text-xs text-gray-500 mb-3">The system schedules agents based on priority and conflict scores to minimize API bottlenecks.</p>
-              <div className="overflow-x-auto rounded-xl border border-gray-200 dark:border-gray-700">
-                <table className="w-full text-xs">
-                  <thead className="bg-gray-50 dark:bg-gray-800">
-                    <tr className="text-[10px] font-mono text-gray-400 uppercase">
-                      <th className="px-3 py-2 text-left">Agent</th>
-                      <th className="px-3 py-2 text-left">Slot</th>
-                      <th className="px-3 py-2 text-left">Priority</th>
-                      <th className="px-3 py-2 text-left">Energy</th>
-                      <th className="px-3 py-2 text-left">Conflict</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                    {qaoa.map((q, i) => {
-                      const m = AGENTS[q.agent_id] ?? {};
-                      return (
-                        <tr key={i} className="hover:bg-gray-50 dark:hover:bg-gray-800">
-                          <td className="px-3 py-2.5 font-mono text-gray-600 dark:text-gray-300">{m.emoji} {q.agent_id?.replace('_agent', '')}</td>
-                          <td className="px-3 py-2.5">
-                            <span className={`px-2 py-0.5 rounded-md text-[10px] font-mono font-bold ${q.slot === 0 ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600' : 'bg-amber-50 dark:bg-amber-900/30 text-amber-600'}`}>
-                              Slot {q.slot}
+          {showAgents && (
+            <div className="divide-y divide-gray-100 dark:divide-gray-800 border-t border-gray-100 dark:border-gray-800">
+              {Object.entries(AGENTS).map(([id, meta]) => {
+                const r = agents[id];
+                if (!r) return null;
+                const isOpen = expandedAgent === id;
+                const text = r.findings ?? '';
+                // Strip CONFIDENCE: line for cleaner display
+                const analysis = text.replace(/CONFIDENCE:\s*[\d.]+\s*—.*/i, '').trim();
+                const preview = analysis.slice(0, 240) + (analysis.length > 240 ? '…' : '');
+
+                return (
+                  <div key={id} style={{ borderLeft: `3px solid ${meta.color}` }}>
+                    <button onClick={() => setExpandedAgent(isOpen ? null : id)}
+                      className="w-full flex items-start gap-3 px-5 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+                      <span className="text-lg mt-0.5">{meta.emoji}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[12px] font-bold text-gray-700 dark:text-gray-200">{meta.name}</span>
+                          {r.confidence && (
+                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full"
+                              style={{ background: `${meta.color}15`, color: meta.color }}>
+                              {(r.confidence * 100).toFixed(0)}%
                             </span>
-                          </td>
-                          <td className="px-3 py-2.5">
-                            <div className="flex items-center gap-2">
-                              <div className="flex-1 h-1 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden min-w-[40px]">
-                                <div className="h-full rounded-full bg-indigo-400"
-                                  style={{ width: `${Math.min((q.priority ?? 0) * 100, 100)}%` }} />
-                              </div>
-                              <span className="font-mono text-gray-600 dark:text-gray-300 text-[10px] w-10">{(q.priority ?? 0).toFixed(3)}</span>
-                            </div>
-                          </td>
-                          <td className="px-3 py-2.5 font-mono font-bold text-emerald-600 dark:text-emerald-400 text-[10px]">
-                            {(q.qaoa_energy ?? 0).toFixed(4)}
-                          </td>
-                          <td className="px-3 py-2.5 font-mono text-violet-600 dark:text-violet-400 text-[10px]">
-                            {(q.conflict_score ?? 0).toFixed(4)}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
+                          )}
+                          {r.model_used && r.model_used !== 'fallback' && (
+                            <span className="text-[10px] text-gray-400 font-mono">{r.model_used}</span>
+                          )}
+                        </div>
+                        <p className="text-[12px] text-gray-500 dark:text-gray-400 leading-relaxed">
+                          {isOpen ? '' : preview}
+                        </p>
+                      </div>
+                      <span className="text-[10px] text-gray-400 mt-1 flex-shrink-0">
+                        {isOpen ? '▲' : '▼'}
+                      </span>
+                    </button>
 
-          {/* Token Usage */}
-          {tm && (
-            <div>
-              <p className="text-[10px] font-mono text-gray-400 uppercase tracking-widest mb-2">Token Usage</p>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
-                {[
-                  { label: 'Used', val: (tm.tokens_used ?? 0).toLocaleString(), color: 'text-blue-600 dark:text-blue-400' },
-                  { label: 'Remaining', val: (tm.tokens_remaining ?? 0).toLocaleString(), color: 'text-emerald-600 dark:text-emerald-400' },
-                  { label: 'API Calls', val: tm.calls_made ?? 0, color: 'text-violet-600 dark:text-violet-400' },
-                  { label: 'Cost (est)', val: `$${(tm.total_cost_usd ?? 0).toFixed(5)}`, color: 'text-amber-600 dark:text-amber-400' },
-                ].map((m, i) => (
-                  <div key={i} className="bg-gray-50 dark:bg-gray-800 rounded-xl p-2.5 text-center">
-                    <p className="text-[9px] font-mono text-gray-400 mb-1">{m.label}</p>
-                    <p className={`text-xs font-black ${m.color}`}>{m.val}</p>
+                    {isOpen && (
+                      <div className="px-5 pb-4 pl-14">
+                        <CitedText text={analysis} baseClass="text-[13px] text-gray-700 dark:text-gray-300 leading-7" />
+                        {r.citations?.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-1.5">
+                            {r.citations.map((c, i) => (
+                              <a key={i}
+                                href={typeof c === 'object' ? (c.source_url || '#') : '#'}
+                                target="_blank" rel="noopener noreferrer"
+                                className="text-[10px] font-mono px-2 py-0.5 rounded-full border no-underline"
+                                style={{ background: `${meta.color}0D`, borderColor: `${meta.color}30`, color: meta.color }}>
+                                {typeof c === 'object' ? c.source_name : c}
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-              <div className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                <div className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full"
-                  style={{ width: `${Math.min(tm.utilization_pct ?? 0, 100)}%`, transition: 'width 1s ease' }} />
-              </div>
-              <p className="text-[10px] text-gray-400 font-mono mt-1 text-right">
-                {(tm.utilization_pct ?? 0).toFixed(1)}% of budget · tier: {tm.current_tier ?? 'standard'}
-              </p>
+                );
+              })}
             </div>
           )}
         </div>
-      )}
-
-      {/* Agent full-view modal */}
-      {modalAgent && (
-        <AgentModal
-          agentId={modalAgent}
-          data={agents[modalAgent]}
-          onClose={() => setModalAgent(null)}
-        />
       )}
     </div>
   );
 }
 
 /* ─────────────────────────────────────────
-   STREAMING VIEW
+   STREAMING VIEW  — shows while agents work
 ───────────────────────────────────────── */
-function StreamingView({ agentResults, statusMsg, elapsed }) {
+function StreamingView({ liveState }) {
+  const { agentResults, statusMsg, elapsed } = liveState;
   const [thinkIdx, setThinkIdx] = useState({});
-  const completed = Object.keys(agentResults).length;
+  const doneCount = Object.keys(agentResults).length;
   const total     = Object.keys(AGENTS).length;
 
   useEffect(() => {
@@ -410,70 +296,73 @@ function StreamingView({ agentResults, statusMsg, elapsed }) {
         });
         return next;
       });
-    }, 1400);
+    }, 1200);
     return () => clearInterval(t);
   }, [agentResults]);
 
   return (
-    <div className="mt-2 space-y-3">
-      {/* Progress bar */}
+    <div className="space-y-3">
+      {/* Status bar */}
       <div className="flex items-center gap-3">
-        <div className="flex-1 h-1 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-          <div className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full transition-all duration-700"
-            style={{ width: `${Math.min((completed / total) * 100, 95)}%` }} />
+        <div className="flex-1 h-1 rounded-full overflow-hidden" style={{ background: 'rgba(0,0,0,0.06)' }}>
+          <div className="h-full rounded-full transition-all duration-700"
+            style={{ width: `${Math.min((doneCount / total) * 100, 95)}%`,
+                     background: 'linear-gradient(90deg, #6366f1, #10b981)' }} />
         </div>
-        <span className="text-xs font-mono text-gray-400 whitespace-nowrap">
-          {completed}/{total} agents · {elapsed}s
+        <span className="text-[11px] font-mono text-gray-400 whitespace-nowrap">
+          {doneCount}/{total} · {elapsed}s
         </span>
       </div>
+      {statusMsg && (
+        <p className="text-[11px] text-gray-400 font-medium">{statusMsg}</p>
+      )}
 
-      {/* Agent cards */}
+      {/* Agent status grid */}
       <div className="grid grid-cols-2 gap-2">
         {Object.entries(AGENTS).map(([id, meta]) => {
           const done = !!agentResults[id];
           const r    = agentResults[id];
-          // Just show first 2 sentences from streaming result
-          const preview = r?.findings?.split(/[.!?]/).filter(s => s.trim()).slice(0, 2).join('. ') + '.';
           return (
             <div key={id}
-              className={`rounded-xl p-3 border transition-all duration-500 ${done
-                ? 'bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 shadow-sm'
-                : 'bg-gray-50 dark:bg-gray-800/60 border-dashed border-gray-200 dark:border-gray-700 opacity-70'}`}
-              style={{ borderLeftWidth: 3, borderLeftColor: done ? meta.color : '#9ca3af' }}>
-              <div className="flex items-center justify-between mb-2">
-                <span className="flex items-center gap-1.5 text-xs font-bold text-gray-700 dark:text-gray-200">
-                  {meta.emoji} {meta.short}
+              className={`rounded-xl px-3 py-2.5 border transition-all duration-300 ${
+                done ? 'bg-white dark:bg-gray-900 shadow-sm' : 'bg-gray-50 dark:bg-gray-800/40 opacity-60'
+              }`}
+              style={{ borderLeft: `3px solid ${done ? meta.color : '#d1d5db'}`, borderColor: done ? `${meta.color}40` : undefined }}>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[12px] font-bold text-gray-700 dark:text-gray-200 flex items-center gap-1.5">
+                  {meta.emoji} {meta.name}
                 </span>
                 {done
-                  ? <span className="text-[10px] font-mono font-bold" style={{ color: meta.color }}>
-                      ✓ {r.confidence ? `${(r.confidence * 100).toFixed(0)}%` : ''}
+                  ? <span className="text-[10px] font-bold" style={{ color: meta.color }}>
+                      ✓ {r?.confidence ? `${(r.confidence * 100).toFixed(0)}%` : 'done'}
                     </span>
                   : <span className="flex gap-0.5">
                       {[0,1,2].map(i => (
-                        <span key={i} className="w-1 h-1 bg-blue-400 rounded-full animate-bounce"
+                        <span key={i} className="w-1 h-1 rounded-full bg-gray-400 animate-bounce"
                           style={{ animationDelay: `${i * 0.15}s`, animationDuration: '0.8s' }} />
                       ))}
                     </span>
                 }
               </div>
-              {done
-                ? <p className="text-[11px] text-gray-600 dark:text-gray-400 leading-relaxed line-clamp-3">{preview}</p>
-                : <p className="text-[10px] text-gray-400 italic font-mono">{meta.think[thinkIdx[id] ?? 0]}</p>
-              }
+              <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                {done
+                  ? (r?.findings ?? '').slice(0, 80) + '…'
+                  : meta.think[thinkIdx[id] ?? 0]}
+              </p>
             </div>
           );
         })}
       </div>
 
-      {/* Chairman */}
-      {completed === total && (
-        <div className="flex items-center gap-3 p-3.5 rounded-xl border border-violet-200 dark:border-violet-800 bg-violet-50 dark:bg-violet-900/20 animate-fade-up">
+      {doneCount === total && (
+        <div className="flex items-center gap-3 px-4 py-3 rounded-xl border border-violet-200 dark:border-violet-800"
+             style={{ background: 'rgba(139,92,246,0.06)' }}>
           <span className="text-xl">👑</span>
-          <div className="flex-1 min-w-0">
-            <p className="text-xs font-bold text-violet-700 dark:text-violet-300">Chairman synthesizing final verdict…</p>
-            {statusMsg && <p className="text-[10px] text-violet-500 dark:text-violet-400 truncate">{statusMsg}</p>}
+          <div>
+            <p className="text-[12px] font-bold text-violet-700 dark:text-violet-300">Synthesizing final answer…</p>
+            {statusMsg && <p className="text-[11px] text-violet-500 truncate">{statusMsg}</p>}
           </div>
-          <Loader2 size={16} className="text-violet-500 animate-spin flex-shrink-0" />
+          <Loader2 size={14} className="text-violet-500 animate-spin ml-auto" />
         </div>
       )}
     </div>
@@ -485,18 +374,21 @@ function StreamingView({ agentResults, statusMsg, elapsed }) {
 ───────────────────────────────────────── */
 function UserBubble({ msg }) {
   return (
-    <div className="flex justify-end animate-slide-r">
-      <div className="max-w-[78%]">
+    <div className="flex justify-end">
+      <div className="max-w-[80%]">
         {msg.files?.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-1.5 justify-end">
+          <div className="flex flex-wrap gap-1.5 mb-2 justify-end">
             {msg.files.map((f, i) => (
-              <span key={i} className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
-                <FileText size={10} /> {f.name}
-              </span>
+              <div key={i} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-medium"
+                   style={{ background: 'rgba(99,102,241,0.1)', color: '#6366f1', border: '1px solid rgba(99,102,241,0.2)' }}>
+                <FileText size={11} />
+                {f.name}
+              </div>
             ))}
           </div>
         )}
-        <div className="bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed shadow-sm">
+        <div className="px-4 py-3 rounded-2xl rounded-tr-sm text-sm font-medium text-white"
+             style={{ background: 'linear-gradient(135deg, #6366f1, #4f46e5)' }}>
           {msg.text}
         </div>
       </div>
@@ -508,66 +400,43 @@ function UserBubble({ msg }) {
    ASSISTANT BUBBLE
 ───────────────────────────────────────── */
 function AssistantBubble({ msg, liveState }) {
-  return (
-    <div className="flex gap-3 animate-slide-l">
-      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center flex-shrink-0 mt-0.5 shadow-md shadow-indigo-500/20">
-        <Brain size={15} className="text-white" />
+  if (msg.streaming && liveState) {
+    return (
+      <div className="max-w-[95%]">
+        <StreamingView liveState={liveState} />
       </div>
-      <div className="flex-1 min-w-0">
-        {msg.streaming && liveState && (
-          <StreamingView
-            agentResults={liveState.agentResults}
-            statusMsg={liveState.statusMsg}
-            elapsed={liveState.elapsed}
-          />
-        )}
-        {!msg.streaming && msg.result && <ResultCard result={msg.result} />}
-        {!msg.streaming && msg.error && (
-          <div className="mt-2 text-sm text-red-600 bg-red-50 dark:bg-red-900/20 px-4 py-3 rounded-xl border border-red-200 dark:border-red-800">
-            ⚠️ {msg.error}
-          </div>
-        )}
+    );
+  }
+  if (msg.error) {
+    return (
+      <div className="px-4 py-3 rounded-2xl text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+        ⚠️ {msg.error}
       </div>
-    </div>
-  );
+    );
+  }
+  if (!msg.result) return null;
+  return <ResultCard result={msg.result} />;
 }
 
 /* ─────────────────────────────────────────
-   WELCOME SCREEN
+   FILE PILL
 ───────────────────────────────────────── */
-const EXAMPLES = [
-  { q: 'Who will win the 2025 ICC Cricket World Cup and why?',      tag: '🏏 Sports'     },
-  { q: 'What are the top AI tools transforming healthcare in 2025?', tag: '🤖 Technology'  },
-  { q: 'Is OpenAI or Google winning the AI race right now?',         tag: '📊 Analysis'   },
-  { q: 'What drives inflation in emerging markets like India?',      tag: '💰 Finance'    },
-  { q: 'Is CRISPR gene editing ready for human clinical use?',       tag: '🧬 BioMed'     },
-  { q: 'What are the biggest geopolitical risks for 2025?',          tag: '🌍 Policy'     },
-];
-
-function WelcomeScreen({ onQuery }) {
+function FilePill({ file, onRemove }) {
   return (
-    <div className="flex flex-col items-center justify-center h-full px-6 py-10 max-w-2xl mx-auto text-center">
-      <div className="mb-6">
-        <Logo size={64} />
-      </div>
-      <h1 className="text-2xl font-black text-gray-900 dark:text-white mb-2">
-        How can NeuroNex help today?
-      </h1>
-      <p className="text-sm text-gray-500 dark:text-gray-400 max-w-md leading-relaxed mb-2">
-        4 specialized AI agents <span className="font-semibold text-gray-700 dark:text-gray-200">debate</span> your question from different expert perspectives — then a Chairman synthesizes a calibrated verdict.
-      </p>
-      <p className="text-xs text-gray-400 mb-8">
-        Supports any domain · Upload PDFs, CSVs, DOCX for document analysis
-      </p>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full text-left">
-        {EXAMPLES.map((ex, i) => (
-          <button key={i} onClick={() => onQuery(ex.q)}
-            className="px-4 py-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/60 hover:border-indigo-300 dark:hover:border-indigo-700 hover:bg-indigo-50/50 dark:hover:bg-indigo-900/20 transition-all group text-left">
-            <span className="text-[10px] font-mono text-gray-400 block mb-0.5">{ex.tag}</span>
-            <span className="text-sm text-gray-700 dark:text-gray-300 group-hover:text-indigo-700 dark:group-hover:text-indigo-300 leading-snug">{ex.q}</span>
-          </button>
-        ))}
-      </div>
+    <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-medium border"
+         style={{
+           background: file.error ? 'rgba(239,68,68,0.08)' : file.uploading ? 'rgba(99,102,241,0.08)' : 'rgba(16,185,129,0.08)',
+           borderColor: file.error ? 'rgba(239,68,68,0.25)' : file.uploading ? 'rgba(99,102,241,0.25)' : 'rgba(16,185,129,0.25)',
+           color: file.error ? '#dc2626' : file.uploading ? '#6366f1' : '#059669',
+         }}>
+      {file.uploading ? <Loader2 size={10} className="animate-spin" /> : <FileText size={10} />}
+      <span className="max-w-[120px] truncate">{file.name}</span>
+      {file.uploaded && <span className="text-[9px] opacity-60">{Math.round(file.chars/1000)}k chars</span>}
+      {!file.uploading && (
+        <button onClick={onRemove} className="ml-1 opacity-50 hover:opacity-100 transition-opacity">
+          <X size={10} />
+        </button>
+      )}
     </div>
   );
 }
@@ -578,64 +447,72 @@ function WelcomeScreen({ onQuery }) {
 function Sidebar({ sessions, activeId, onSelect, onNew, onDelete, isDark, setDark, open, setOpen, onGoHome }) {
   return (
     <>
+      {/* Mobile overlay */}
       {open && (
-        <div className="fixed inset-0 bg-black/50 z-20 md:hidden" onClick={() => setOpen(false)} />
+        <div className="fixed inset-0 bg-black/40 z-30 md:hidden" onClick={() => setOpen(false)} />
       )}
+
       <aside className={`
-        fixed md:static inset-y-0 left-0 z-30 w-60 flex flex-col
-        bg-gray-50 dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800
-        transition-transform duration-300
+        fixed md:relative z-40 md:z-auto
+        flex flex-col h-full
+        w-64 flex-shrink-0
+        border-r border-gray-200 dark:border-gray-800
+        bg-gray-50 dark:bg-gray-900
+        transition-transform duration-200
         ${open ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}
       `}>
-        {/* Header */}
-        <div className="px-3 py-3 flex items-center gap-2 border-b border-gray-200 dark:border-gray-800">
-          <Logo size={28} withText textClass="text-sm text-gray-900 dark:text-white" />
-          <div className="flex-1" />
-          <button onClick={onNew} title="New chat"
-            className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-500 transition-colors">
-            <Plus size={15} />
+        {/* Logo */}
+        <div className="flex items-center justify-between px-4 py-4 border-b border-gray-200 dark:border-gray-800">
+          <button onClick={onGoHome} className="flex items-center gap-2 hover:opacity-80 transition-opacity">
+            <Logo size={28} withText textClass="text-sm font-bold text-gray-900 dark:text-white" />
+          </button>
+          <button onClick={() => setOpen(false)} className="md:hidden p-1 rounded-lg text-gray-400 hover:text-gray-600">
+            <X size={16} />
           </button>
         </div>
 
-        {/* Sessions */}
-        <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+        {/* New chat */}
+        <div className="px-3 pt-3 pb-2">
+          <button onClick={onNew}
+            className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-medium text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-700 hover:border-indigo-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-all bg-white dark:bg-gray-800">
+            <Plus size={15} />
+            New Research
+          </button>
+        </div>
+
+        {/* Session list */}
+        <div className="flex-1 overflow-y-auto px-3 py-1 space-y-0.5">
           {sessions.length === 0 && (
-            <p className="text-[11px] text-gray-400 text-center py-8 px-3 leading-relaxed">
-              No conversations yet.<br />Start asking!
-            </p>
+            <p className="text-center text-[11px] text-gray-400 py-8">No conversations yet</p>
           )}
           {sessions.map(s => (
             <div key={s.id}
-              onClick={() => { onSelect(s.id); setOpen(false); }}
               className={`group flex items-center gap-2 px-3 py-2.5 rounded-xl cursor-pointer transition-colors ${
                 s.id === activeId
-                  ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'
-                  : 'hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-500 dark:text-gray-400'
-              }`}>
-              <MessageSquare size={12} className="flex-shrink-0 opacity-60" />
-              <span className="text-xs font-medium truncate flex-1">{s.title || 'New chat'}</span>
-              <button
-                onClick={e => { e.stopPropagation(); onDelete(s.id); }}
-                className="opacity-0 group-hover:opacity-100 p-1 rounded hover:text-red-500 transition-all flex-shrink-0">
-                <Trash2 size={11} />
+                  ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300'
+                  : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+              }`}
+              onClick={() => onSelect(s.id)}>
+              <MessageSquare size={13} className="flex-shrink-0 opacity-60" />
+              <div className="flex-1 min-w-0">
+                <p className="text-[12px] font-medium truncate">{s.title || 'New Research'}</p>
+                <p className="text-[10px] opacity-50">{timeAgo(s.createdAt)}</p>
+              </div>
+              <button onClick={e => { e.stopPropagation(); onDelete(s.id); }}
+                className="opacity-0 group-hover:opacity-100 p-1 rounded text-gray-400 hover:text-red-500 transition-all flex-shrink-0">
+                <Trash2 size={12} />
               </button>
             </div>
           ))}
         </div>
 
-        {/* Footer */}
-        <div className="p-3 border-t border-gray-200 dark:border-gray-800 space-y-1">
-          <button onClick={onGoHome}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 hover:text-indigo-500 transition-all">
-            <Home size={13} /> Back to Home
+        {/* Bottom controls */}
+        <div className="border-t border-gray-200 dark:border-gray-800 px-3 py-3 flex items-center justify-between">
+          <span className="text-[10px] font-mono text-gray-400">gemini · neo4j · 4 agents</span>
+          <button onClick={() => setDark(d => !d)}
+            className="p-2 rounded-lg text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors">
+            {isDark ? <Sun size={15} /> : <Moon size={15} />}
           </button>
-          <div className="flex items-center justify-between">
-            <span className="text-[9px] text-gray-400 font-mono leading-tight px-2">gemini · neo4j · 4 agents</span>
-            <button onClick={() => setDark(v => !v)}
-              className="p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-400 transition-colors">
-              {isDark ? <Sun size={13} /> : <Moon size={13} />}
-            </button>
-          </div>
         </div>
       </aside>
     </>
@@ -643,31 +520,35 @@ function Sidebar({ sessions, activeId, onSelect, onNew, onDelete, isDark, setDar
 }
 
 /* ─────────────────────────────────────────
-   FILE UPLOAD PILL (with server upload state)
+   WELCOME SCREEN
 ───────────────────────────────────────── */
-function FilePill({ file, onRemove }) {
+const EXAMPLES = [
+  "How to get an AI dev job in 2026 as a fresher?",
+  "What are the biggest trends shaping AI research right now?",
+  "Explain transformer architecture and attention mechanism",
+  "Is OpenAI or Google winning the AI race?",
+  "How does RAG (Retrieval Augmented Generation) actually work?",
+  "What is the significance of 'Attention is All You Need'?",
+];
+
+function WelcomeScreen({ onQuery }) {
   return (
-    <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono"
-      style={{
-        background: file.uploaded ? 'rgba(16,185,129,0.08)' : file.error ? 'rgba(239,68,68,0.08)' : 'rgba(99,102,241,0.08)',
-        borderColor: file.uploaded ? 'rgba(16,185,129,0.3)' : file.error ? 'rgba(239,68,68,0.3)' : 'rgba(99,102,241,0.3)',
-        color: file.uploaded ? '#10b981' : file.error ? '#ef4444' : '#6366f1',
-      }}>
-      {file.uploading
-        ? <Loader2 size={11} className="animate-spin" />
-        : file.uploaded
-        ? <CheckCircle size={11} />
-        : file.error
-        ? <XCircle size={11} />
-        : <FileText size={11} />
-      }
-      <span className="max-w-[100px] truncate">{file.name}</span>
-      {file.uploading && <span className="opacity-60">uploading…</span>}
-      {file.uploaded && <span className="opacity-60">{(file.chars / 1000).toFixed(0)}k chars</span>}
-      {file.error && <span className="opacity-60">failed</span>}
-      <button onClick={onRemove} className="ml-1 hover:opacity-60 transition-opacity">
-        <X size={11} />
-      </button>
+    <div className="flex flex-col items-center justify-center min-h-full px-4 py-16 text-center">
+      <div className="mb-6 p-4 rounded-3xl" style={{ background: 'linear-gradient(135deg, rgba(99,102,241,0.1), rgba(16,185,129,0.08))' }}>
+        <Brain size={40} className="text-indigo-600" />
+      </div>
+      <h1 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">NeuroNex Research AI</h1>
+      <p className="text-sm text-gray-500 dark:text-gray-400 max-w-sm mb-10">
+        4 specialized AI agents debate your question, grounded in live-fetched knowledge from Wikipedia, ArXiv, and more.
+      </p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-w-xl w-full">
+        {EXAMPLES.map((ex, i) => (
+          <button key={i} onClick={() => onQuery(ex)}
+            className="px-4 py-3 rounded-xl text-left text-[12px] text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700 hover:border-indigo-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 transition-all">
+            {ex}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -675,49 +556,17 @@ function FilePill({ file, onRemove }) {
 /* ─────────────────────────────────────────
    MAIN APP
 ───────────────────────────────────────── */
-export default function NeuroNexApp() {
-  /* Theme */
-  const [isDark, setIsDarkRaw] = useState(() => localStorage.getItem(LS_THEME) !== 'light');
-  const setDark = useCallback((v) => {
-    const next = typeof v === 'function' ? v(isDark) : v;
-    setIsDarkRaw(next);
-    localStorage.setItem(LS_THEME, next ? 'dark' : 'light');
-    document.documentElement.classList.toggle('dark', next);
-  }, [isDark]);
-  useEffect(() => { document.documentElement.classList.toggle('dark', isDark); }, []);
-
-  /* Navigation */
+export default function HomePage() {
   const navigate = useNavigate();
-
-  /* Set body class for fixed-height layout */
-  useEffect(() => {
-    document.body.classList.add('chat-mode');
-    return () => document.body.classList.remove('chat-mode');
-  }, []);
-
-  /* Sessions */
-  const [sessions, setSessions] = useState(loadSessions);
-  const [activeId, setActiveId] = useState(() => {
-    const saved = localStorage.getItem(LS_ACTIVE);
-    const sessions = loadSessions();
-    return sessions.find(s => s.id === saved) ? saved : (sessions[0]?.id ?? null);
-  });
-
-  useEffect(() => { saveSessions(sessions); }, [sessions]);
-  useEffect(() => { if (activeId) localStorage.setItem(LS_ACTIVE, activeId); }, [activeId]);
-
-  const activeSession = sessions.find(s => s.id === activeId) ?? null;
-
-  /* Sidebar */
-  const [sideOpen, setSideOpen] = useState(false);
-
-  /* Input */
-  const [query, setQuery]     = useState('');
-  const [files, setFiles]     = useState([]);   // [{name, size, contextId, uploaded, uploading, error, chars}]
-  const [streaming, setStreaming] = useState(false);
-
-  /* Live stream state */
-  const [liveState, setLiveState] = useState({ agentResults: {}, statusMsg: '', elapsed: 0 });
+  const [sessions,   setSessions ] = useState(() => loadSessions());
+  const [activeId,   setActiveId ] = useState(() => localStorage.getItem(LS_ACTIVE) || null);
+  const [isDark,     setDark     ] = useState(() => localStorage.getItem(LS_THEME) === 'dark');
+  const [sideOpen,   setSideOpen ] = useState(false);
+  const [query,      setQuery    ] = useState('');
+  const [domain,     setDomain   ] = useState('general');
+  const [streaming,  setStreaming ] = useState(false);
+  const [files,      setFiles    ] = useState([]);
+  const [liveState,  setLiveState] = useState({ agentResults: {}, statusMsg: '', elapsed: 0, ragSources: [] });
 
   const esRef       = useRef(null);
   const timerRef    = useRef(null);
@@ -725,10 +574,24 @@ export default function NeuroNexApp() {
   const textareaRef = useRef(null);
   const fileRef     = useRef(null);
 
-  /* Auto-scroll */
+  // Persist dark mode
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', isDark);
+    localStorage.setItem(LS_THEME, isDark ? 'dark' : 'light');
+  }, [isDark]);
+
+  // Persist sessions
+  useEffect(() => { saveSessions(sessions); }, [sessions]);
+  useEffect(() => {
+    if (activeId) localStorage.setItem(LS_ACTIVE, activeId);
+  }, [activeId]);
+
+  // Auto-scroll
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeSession?.messages?.length, liveState.agentResults]);
+  }, [sessions, liveState.agentResults]);
+
+  const activeSession = sessions.find(s => s.id === activeId) ?? null;
 
   /* Session helpers */
   const createSession = useCallback(() => {
@@ -746,7 +609,7 @@ export default function NeuroNexApp() {
     });
   }, [activeId]);
 
-  /* File upload to backend */
+  /* File upload */
   const uploadFile = async (f) => {
     const tempId = genId();
     setFiles(prev => [...prev, { id: tempId, name: f.name, size: f.size, uploading: true, uploaded: false, error: null, contextId: null, chars: 0 }]);
@@ -772,19 +635,17 @@ export default function NeuroNexApp() {
     Array.from(fileList).slice(0, 5).forEach(uploadFile);
   };
 
-  /* Submit */
+  /* Submit query */
   const submit = useCallback((overrideQ) => {
     const q = (overrideQ ?? query).trim();
     if (!q || streaming) return;
-
-    // Don't allow submit if any file is still uploading
     if (files.some(f => f.uploading)) return;
 
     setQuery('');
     setStreaming(true);
-    setLiveState({ agentResults: {}, statusMsg: 'Connecting to council…', elapsed: 0 });
+    setLiveState({ agentResults: {}, statusMsg: 'Starting agents…', elapsed: 0, ragSources: [] });
 
-    /* Get / create session */
+    // Get or create session
     let sid = activeId;
     const sessionExists = sessions.find(s => s.id === sid);
     if (!sessionExists) {
@@ -794,26 +655,20 @@ export default function NeuroNexApp() {
       setActiveId(sid);
     }
 
-    /* Collect context_ids from successfully uploaded files */
-    const contextIds = files.filter(f => f.uploaded && f.contextId).map(f => f.contextId);
+    const contextIds    = files.filter(f => f.uploaded && f.contextId).map(f => f.contextId);
     const attachedFiles = files.map(f => ({ name: f.name, size: f.size }));
     setFiles([]);
 
-    /* Add user + placeholder assistant message */
     const userMsg = { role: 'user', text: q, files: attachedFiles };
     const asstMsg = { role: 'assistant', streaming: true };
     setSessions(prev => prev.map(s => s.id === sid
-      ? {
-          ...s,
-          title: s.messages.length === 0 ? q.slice(0, 50) : s.title,
-          messages: [...s.messages, userMsg, asstMsg],
-        }
+      ? { ...s, title: s.messages.length === 0 ? q.slice(0, 50) : s.title, messages: [...s.messages, userMsg, asstMsg] }
       : s
     ));
 
-    /* Start EventSource */
+    // EventSource stream
     const tid = `thread_${Date.now()}`;
-    let url = `/api/v1/research/stream?query=${encodeURIComponent(q)}&thread_id=${tid}`;
+    let url = `/api/v1/research/stream?query=${encodeURIComponent(q)}&thread_id=${tid}&domain=${domain}`;
     if (contextIds.length > 0) url += `&context_ids=${contextIds.join(',')}`;
 
     const es = new EventSource(url);
@@ -824,7 +679,7 @@ export default function NeuroNexApp() {
       setLiveState(prev => ({ ...prev, elapsed: Math.floor((Date.now() - t0) / 1000) }));
     }, 500);
 
-    const patchLastAssistant = (updater) => {
+    const patchLast = (updater) => {
       setSessions(prev => prev.map(s => {
         if (s.id !== sid) return s;
         const msgs = [...s.messages];
@@ -834,11 +689,18 @@ export default function NeuroNexApp() {
       }));
     };
 
+    let latestRagSources = [];
+
     es.addEventListener('status', e => {
       const d = JSON.parse(e.data);
       setLiveState(prev => ({ ...prev, statusMsg: d.message ?? '' }));
     });
     es.addEventListener('heartbeat', () => {});
+    es.addEventListener('rag_status', e => {
+      const d = JSON.parse(e.data);
+      latestRagSources = d.citations ?? [];
+      setLiveState(prev => ({ ...prev, ragSources: latestRagSources }));
+    });
     es.addEventListener('agent_result', e => {
       const d = JSON.parse(e.data);
       setLiveState(prev => ({ ...prev, agentResults: { ...prev.agentResults, [d.agent_id]: d } }));
@@ -847,28 +709,22 @@ export default function NeuroNexApp() {
       clearInterval(timerRef.current);
       es.close();
       const result = JSON.parse(e.data);
-      patchLastAssistant(() => ({ role: 'assistant', streaming: false, result }));
+      patchLast(() => ({ role: 'assistant', streaming: false, result: { ...result, ragSources: latestRagSources } }));
       setStreaming(false);
-      setLiveState({ agentResults: {}, statusMsg: '', elapsed: 0 });
+      setLiveState({ agentResults: {}, statusMsg: '', elapsed: 0, ragSources: [] });
     });
     es.onerror = () => {
       clearInterval(timerRef.current);
       es.close();
-      patchLastAssistant(() => ({
-        role: 'assistant',
-        streaming: false,
-        error: 'Connection error. Make sure the backend is running on port 8000 and retry.',
-      }));
+      patchLast(() => ({ role: 'assistant', streaming: false, error: 'Connection error. Make sure the backend is running on port 8000.' }));
       setStreaming(false);
     };
-  }, [query, streaming, files, activeId, sessions]);
+  }, [query, streaming, files, activeId, sessions, domain]);
 
-  /* Keyboard */
   const onKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
   };
 
-  /* Auto-resize textarea */
   useEffect(() => {
     if (!textareaRef.current) return;
     textareaRef.current.style.height = 'auto';
@@ -880,8 +736,9 @@ export default function NeuroNexApp() {
   const hasUploading = files.some(f => f.uploading);
 
   return (
-    <div className="flex h-screen bg-white dark:bg-gray-950 overflow-hidden">
-      {/* Sidebar */}
+    <div className={`flex h-screen overflow-hidden ${isDark ? 'dark' : ''}`}
+         style={{ background: isDark ? '#09090b' : '#ffffff' }}>
+
       <Sidebar
         sessions={sessions}
         activeId={activeId}
@@ -895,18 +752,14 @@ export default function NeuroNexApp() {
         onGoHome={() => navigate('/')}
       />
 
-      {/* Main panel */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
 
-        <div className="md:hidden flex items-center gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 flex-shrink-0">
-          <button onClick={() => setSideOpen(true)} className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500 transition-colors">
+        {/* Mobile header */}
+        <div className="md:hidden flex items-center gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-800 flex-shrink-0 bg-white dark:bg-gray-950">
+          <button onClick={() => setSideOpen(true)} className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
             <Menu size={18} />
           </button>
-          <Logo size={26} withText textClass="text-sm text-gray-900 dark:text-white" />
-          <div className="flex-1" />
-          <button onClick={() => navigate('/')} className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 transition-colors" title="Home">
-            <Home size={16} />
-          </button>
+          <Logo size={24} withText textClass="text-sm font-bold text-gray-900 dark:text-white" />
         </div>
 
         {/* Chat area */}
@@ -914,11 +767,10 @@ export default function NeuroNexApp() {
           {showWelcome ? (
             <WelcomeScreen onQuery={q => submit(q)} />
           ) : (
-            <div className="max-w-3xl mx-auto px-4 py-6 space-y-5">
+            <div className="max-w-3xl mx-auto px-4 py-8 space-y-6">
               {messages.map((msg, i) => {
                 const isLastAssistant = msg.role === 'assistant' && i === messages.length - 1;
-                if (msg.role === 'user')
-                  return <UserBubble key={i} msg={msg} />;
+                if (msg.role === 'user') return <UserBubble key={i} msg={msg} />;
                 return (
                   <AssistantBubble
                     key={i}
@@ -927,18 +779,33 @@ export default function NeuroNexApp() {
                   />
                 );
               })}
-              <div ref={bottomRef} className="h-2" />
+              <div ref={bottomRef} className="h-4" />
             </div>
           )}
         </div>
 
-        {/* Input area */}
-        <div className="flex-shrink-0 border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-4 py-3">
-          <div className="max-w-3xl mx-auto">
+        {/* Input bar */}
+        <div className="flex-shrink-0 border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-4 py-4">
+          <div className="max-w-3xl mx-auto space-y-2">
+
+            {/* Domain pills */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-[10px] text-gray-400 uppercase tracking-widest font-semibold mr-1">Domain:</span>
+              {['general','medical','legal','finance','technology','science'].map(d => (
+                <button key={d} onClick={() => setDomain(d)} disabled={streaming}
+                  className={`px-2.5 py-1 rounded-full text-[10px] font-semibold border transition-all disabled:opacity-50 ${
+                    domain === d
+                      ? 'bg-indigo-600 text-white border-indigo-600'
+                      : 'text-gray-500 border-gray-200 dark:border-gray-700 hover:border-indigo-400 hover:text-indigo-600 dark:bg-gray-900'
+                  }`}>
+                  {d}
+                </button>
+              ))}
+            </div>
 
             {/* File chips */}
             {files.length > 0 && (
-              <div className="flex flex-wrap gap-2 mb-2">
+              <div className="flex flex-wrap gap-1.5">
                 {files.map((f, i) => (
                   <FilePill key={f.id ?? i} file={f}
                     onRemove={() => setFiles(prev => prev.filter((_, j) => j !== i))} />
@@ -947,15 +814,12 @@ export default function NeuroNexApp() {
             )}
 
             {/* Input box */}
-            <div className={`flex items-end gap-2 rounded-2xl border shadow-sm transition-all
-              ${streaming || hasUploading
-                ? 'border-indigo-300 dark:border-indigo-700'
-                : 'border-gray-300 dark:border-gray-700 focus-within:border-indigo-400 dark:focus-within:border-indigo-600'
-              } bg-white dark:bg-gray-900 px-3 py-2`}>
+            <div className={`flex items-end gap-2 rounded-2xl border shadow-sm transition-all px-3 py-2
+              ${streaming ? 'border-indigo-300 dark:border-indigo-700' : 'border-gray-300 dark:border-gray-700 focus-within:border-indigo-400'}
+              bg-white dark:bg-gray-900`}>
 
-              {/* File button */}
               <button onClick={() => fileRef.current?.click()} disabled={streaming}
-                title="Upload document (PDF, CSV, TXT, DOCX, JSON)"
+                title="Upload document"
                 className="p-2 rounded-xl text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 disabled:opacity-40 transition-colors flex-shrink-0">
                 <Paperclip size={17} />
               </button>
@@ -964,30 +828,28 @@ export default function NeuroNexApp() {
                 className="hidden"
                 onChange={e => { handleFileSelect(e.target.files); e.target.value = ''; }} />
 
-              {/* Textarea */}
               <textarea ref={textareaRef} rows={1} value={query}
                 onChange={e => setQuery(e.target.value)} onKeyDown={onKeyDown}
                 disabled={streaming}
                 placeholder={
                   hasUploading ? 'Uploading files…'
-                  : streaming ? 'Analyzing your question…'
-                  : 'Message NeuroNex… (Upload files to analyze documents)'
+                  : streaming ? 'Analyzing…'
+                  : `Ask anything… [${domain}]`
                 }
                 className="flex-1 resize-none bg-transparent py-2 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none leading-relaxed disabled:opacity-50"
                 style={{ minHeight: 40, maxHeight: 160 }} />
 
-              {/* Send button */}
               <button onClick={() => submit()}
                 disabled={(!query.trim() && files.every(f => !f.uploaded)) || streaming || hasUploading}
-                className="p-2.5 rounded-xl bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-700 dark:hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0 active:scale-95 shadow-sm">
+                className="p-2.5 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex-shrink-0 active:scale-95 shadow-sm">
                 {streaming
                   ? <Loader2 size={16} className="animate-spin" />
                   : <Send size={16} />}
               </button>
             </div>
 
-            <p className="text-center text-[10px] text-gray-400 mt-1.5">
-              Enter to send · Shift+Enter for new line · Supports PDF, CSV, DOCX, TXT, JSON
+            <p className="text-center text-[10px] text-gray-400">
+              Enter to send · Shift+Enter for new line · Upload PDF, CSV, DOCX, TXT
             </p>
           </div>
         </div>

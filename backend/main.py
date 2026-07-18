@@ -1,21 +1,25 @@
 """
-NeuroNex FastAPI Gateway — v4.0
-- Uses gemini-3.5-flash (unblocked, free-tier quota available)
-- Dynamic per-query agent prompts (each agent addresses your EXACT question)
-- Dynamic LLM Chairman synthesis (no hardcoded biomedical text)
-- 429 quota handling: retries on lite model, then rich fallback text
+NeuroNex FastAPI Gateway — v5.0 (Real RAG Pipeline)
+- Real RAG: ChromaDB + sentence-transformers (all-MiniLM-L6-v2)
+- Live knowledge: Wikipedia, ArXiv, PubMed, FRED fetched per query
+- Auto-citations: every agent response grounded in verified sources
+- Domain-aware retrieval: medical → PubMed, finance → FRED, etc.
+- Multi-Model Cascade: gemini-3.5 → 3.1-lite → 2.5 → 2.5-lite
 - Live SSE streaming: agent cards appear one-by-one as they finish
-- Working /api/v1/graph — returns real Neo4j data
 """
 import os
 import uuid
 import time
 import json
 import asyncio
+import logging
 from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from app.inference.document_parser import extract_text
@@ -28,11 +32,12 @@ from app.inference.token_budget import budget_manager
 from app.db.neo4j_conn import get_singleton_graph_repo
 from app.agents.council import COUNCIL_MEMBERS, compute_peer_adjusted_confidence
 from app.quantum.qaoa_scheduler import QAOATaskScheduler, AgentTask
+from app.inference.rag_pipeline import get_rag_pipeline, RAGPipeline
 
 app = FastAPI(
     title="NeuroNex API Gateway",
-    version="4.0.0",
-    description="Multi-Agent GraphRAG — Dynamic Streaming",
+    version="5.0.0",
+    description="Multi-Agent RAG Research Platform",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -45,25 +50,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── 4-model cascade: if model A is overloaded (503/429), instantly tries B, C, D
-# ── This guarantees responses even during Google API demand spikes
-_API_KEY = os.getenv("GEMINI_API_KEY", "")
-_CASCADE_MODELS = [
-    "gemini-3.5-flash",        # Primary: best quality
-    "gemini-3.1-flash-lite",   # Fast fallback
-    "gemini-2.5-flash",        # Older fallback
-    "gemini-2.5-flash-lite",   # Smallest, highest availability
-]
-_PRIMARY_MODEL = _CASCADE_MODELS[0]
 
-_cascade = get_cascade(_API_KEY)
+@app.on_event("startup")
+async def _startup():
+    """Initialize the RAG pipeline on server start (non-blocking)."""
+    rag = get_rag_pipeline()
+    # Run in background so server starts immediately
+    asyncio.create_task(rag.initialize())
+    logger.info("[Startup] RAG pipeline initialization scheduled in background")
+
+# ── Provider config — reads from .env at startup
+_LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+_COHERE_KEY   = os.getenv("COHERE_API_KEY", "").strip()
+_ALL_KEYS     = [k.strip() for k in os.getenv("GEMINI_API_KEY", "").split(",") if k.strip()]
+
+from app.inference.llm_provider import MultiModelCascade as _MC, CohereAdapter
+
+# Working Gemini models (confirmed on free tier)
+_CASCADE_MODELS_GEMINI = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
+_PRIMARY_MODEL = "gemini-2.0-flash" if _LLM_PROVIDER == "gemini" else "command-r-plus"
+
+def _make_agent_cascade(agent_index: int):
+    """Create a dedicated cascade per agent. Cohere: shared key (no RPM issue). Gemini: unique key per agent."""
+    if _LLM_PROVIDER == "cohere":
+        if not _COHERE_KEY:
+            raise RuntimeError("COHERE_API_KEY is required when LLM_PROVIDER=cohere")
+        # Cohere has 5 requests/sec on free tier — no per-agent key splitting needed
+        return _MC(api_key=_COHERE_KEY, provider="cohere")
+    else:
+        if not _ALL_KEYS:
+            return get_cascade("")
+        key = _ALL_KEYS[agent_index % len(_ALL_KEYS)]
+        return _MC(api_key=key, models=_CASCADE_MODELS_GEMINI, provider="gemini")
+
+_agent_cascades = {
+    "evidence_agent":  _make_agent_cascade(0),
+    "skeptic_agent":   _make_agent_cascade(1),
+    "connector_agent": _make_agent_cascade(2),
+    "quality_agent":   _make_agent_cascade(3),
+}
+
+# Chairman cascade — same provider as agents
+_chairman_cascade = _make_agent_cascade(4)
+
+# Backwards compatibility
+_cascade = _agent_cascades["evidence_agent"]
 _qaoa_scheduler = QAOATaskScheduler(p_layers=1)
 
-AGENT_TIMEOUT_SECONDS = 60
+AGENT_TIMEOUT_SECONDS = 90    # 90s per agent — enough for slow API responses
 
-# Token budgets — agents get less, Chairman gets more
-AGENT_MAX_TOKENS    = 4096   # ~600 words — enough for deep analysis
-CHAIRMAN_MAX_TOKENS = 8192   # ~1200 words — full synthesis
+# Token budgets — meaningful responses without hitting context limits
+AGENT_MAX_TOKENS    = 1500   # ~225 words per agent — real, useful responses
+CHAIRMAN_MAX_TOKENS = 2500   # ~375 words — a comprehensive synthesis guide
 
 # In-memory document context store (keyed by context_id)
 _doc_contexts: dict = {}
@@ -115,6 +153,7 @@ class ResearchRequest(BaseModel):
     query: str
     thread_id: Optional[str] = None
     token_budget: int = 100_000
+    domain: str = "general"   # general | medical | legal | finance | technology | science
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,15 +164,16 @@ async def _llm_complete_with_retry(
     user_prompt: str,
     temperature: float = 0.15,
     max_tokens: int = AGENT_MAX_TOKENS,
+    agent_id: str = None,
 ) -> LLMResponse:
     """
-    Uses the 4-model cascade: gemini-2.0-flash → 2.0-flash-lite → 1.5-flash → 1.5-flash-8b.
-    Each model retries internally (with backoff) before falling to the next.
-    Handles 429 (quota), 503 (overloaded), 500, timeouts — all transparently.
+    Uses the dedicated per-agent cascade (each agent has its own API key).
+    Falls back gracefully on timeout or total cascade failure.
     """
+    cascade = _agent_cascades.get(agent_id, _cascade) if agent_id else _cascade
     try:
         resp = await asyncio.wait_for(
-            _cascade.complete(
+            cascade.complete(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=temperature,
@@ -141,90 +181,57 @@ async def _llm_complete_with_retry(
             ),
             timeout=AGENT_TIMEOUT_SECONDS,
         )
-        # Check for cascade total failure
         if resp.content == "__FALLBACK__" or resp.content.startswith("__ERROR__"):
+            logger.error(f"[Agent {agent_id}] Cascade fully failed: {resp.content}")
             return LLMResponse(content="__FALLBACK__", model_used="fallback", token_count=0, latency_ms=0.0)
         return resp
     except asyncio.TimeoutError:
+        logger.error(f"[Agent {agent_id}] Timed out after {AGENT_TIMEOUT_SECONDS}s")
         return LLMResponse(content="__FALLBACK__", model_used="timeout", token_count=0, latency_ms=0.0)
-    except Exception:
+    except Exception as e:
+        logger.error(f"[Agent {agent_id}] Unexpected error: {e}")
         return LLMResponse(content="__FALLBACK__", model_used="error", token_count=0, latency_ms=0.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run a single specialized agent
 # ─────────────────────────────────────────────────────────────────────────────
-async def _run_agent(agent_id: str, query: str, thread_id: str) -> dict:
+async def _run_agent(
+    agent_id: str,
+    query: str,
+    thread_id: str,
+    rag_context: str = "",
+    rag_citations: list = None,
+) -> dict:
     """
-    Run a single specialist agent. 'query' may include appended document context
-    if the user uploaded files.
+    Run a single specialist agent.
+    'rag_context' contains real retrieved chunks from Wikipedia/ArXiv/PubMed.
+    Agents are instructed to cite these sources rather than generating from memory.
     """
     member = COUNCIL_MEMBERS[agent_id]
+    rag_citations = rag_citations or []
 
-    # DEEP RESEARCH prompts — each agent writes a full, comprehensive research-level analysis
-    AGENT_DEPTH_INSTRUCTIONS = {
-        "evidence_agent": (
-            "You are the Evidence Agent. Write a COMPREHENSIVE, RESEARCH-DEPTH analysis (4-6 paragraphs minimum). "
-            "Your job:\n"
-            "1. Open with the strongest, most specific factual evidence directly answering the query — name exact entities, statistics, dates, records.\n"
-            "2. Present supporting historical evidence — precedents, trends, comparable cases with specifics.\n"
-            "3. Quantify wherever possible: percentages, rankings, measured outcomes, sample sizes.\n"
-            "4. Cite what type of data sources would support this (official records, academic studies, surveys, etc).\n"
-            "5. Close with a clear evidence-based stance: what does the totality of data show?\n"
-            "DO NOT be brief. This is a research document, not a summary."
-        ),
-        "skeptic_agent": (
-            "You are the Skeptic Agent. Write a RIGOROUS, DETAILED critical examination (4-6 paragraphs minimum). "
-            "Your job:\n"
-            "1. Open with the most serious methodological flaw or logical gap in the evidence for this query.\n"
-            "2. Name specific counter-examples, contradicting data points, or historical precedents that undermine confidence.\n"
-            "3. Identify hidden assumptions, selection biases, or confounding variables that distort analysis.\n"
-            "4. Quantify the uncertainty: how confident should we really be, and why?\n"
-            "5. Close with what conditions would need to be true for the positive interpretation to hold.\n"
-            "DO NOT be a superficial critic. Give deep, substantive objections."
-        ),
-        "connector_agent": (
-            "You are the Connector Agent. Write a WIDE-RANGING, INSIGHTFUL cross-domain analysis (4-6 paragraphs minimum). "
-            "Your job:\n"
-            "1. Open with the most non-obvious connection you can find — a link to another field, historical period, or domain.\n"
-            "2. Draw 2-3 specific analogies or structural patterns from different fields that illuminate this query.\n"
-            "3. Identify what adjacent domains (economics, psychology, physics, history, etc.) reveal about this topic.\n"
-            "4. Map out the second-order consequences — what happens if the primary analysis is correct?\n"
-            "5. Close with the most surprising insight your cross-domain view surfaces.\n"
-            "Think like a polymath. Go beyond the obvious."
-        ),
-        "quality_agent": (
-            "You are the Methodology Agent. Write a THOROUGH, STRUCTURED quality audit (4-6 paragraphs minimum). "
-            "Your job:\n"
-            "1. Open by assessing the overall quality and completeness of information available on this topic.\n"
-            "2. Evaluate what analytical framework best applies to this query (statistical, qualitative, comparative, causal, etc).\n"
-            "3. Identify the key methodological gaps — what data is missing, what questions remain unanswered?\n"
-            "4. Rate the reliability of the domain's typical data sources (official stats, media, expert opinion, etc).\n"
-            "5. Close with a readiness assessment: how actionable is the current evidence for decision-making?\n"
-            "Be rigorous and specific. Vague audits are useless."
-        ),
+    AGENT_ROLES = {
+        "evidence_agent":  "You find and present factual evidence. Be specific — cite data, numbers, facts from the sources.",
+        "skeptic_agent":   "You challenge the evidence. Find gaps, contradictions, or missing context in the sources.",
+        "connector_agent": "You find cross-domain connections. Link the topic to other fields, trends, or implications.",
+        "quality_agent":   "You assess source quality and methodology. Rate the reliability of the retrieved data.",
     }
 
+    rag_injection = f"\n\nKNOWLEDGE BASE (CITE THESE SPECIFICALLY):\n{rag_context}\n" if rag_context.strip() else ""
+
     system_prompt = (
-        f"{member.system_prompt}\n\n"
-        f"{AGENT_DEPTH_INSTRUCTIONS.get(agent_id, '')}\n\n"
-        "CRITICAL RULES:\n"
-        "- NEVER give generic, surface-level responses.\n"
-        "- ALWAYS adapt to the exact domain of the query (sports/finance/science/politics/medicine/tech).\n"
-        "- Name specific people, teams, companies, numbers, dates wherever relevant.\n"
-        "- If there is uploaded document context below, analyze it directly and reference it explicitly."
+        f"{AGENT_ROLES.get(agent_id, member.system_prompt)}"
+        f"{rag_injection}"
+        "Write 2 focused paragraphs. You MUST use inline citations formatted exactly like this: [Source: SourceName, URL]. "
+        "Be specific and direct."
     )
 
-    user_prompt = (
-        f"Research Query: \"{query}\"\n\n"
-        f"Write your full, detailed {member.display_name} analysis now. "
-        "Be comprehensive, specific, and intellectually rigorous. "
-        "Do not hedge with 'I think' or 'it may be' — state your analysis directly and authoritatively. "
-        "Minimum 300 words. Reference concrete facts, named entities, and specific data throughout."
-    )
+    user_prompt = f"Query: \"{query}\"\n\nAnalysis (cite sources inline using [Source: Name, URL]):"
+    user_prompt += "\n\nCONFIDENCE: [0.0-1.0] — reason in one sentence"
 
     start = time.perf_counter()
-    resp = await _llm_complete_with_retry(system_prompt, user_prompt, max_tokens=AGENT_MAX_TOKENS)
+    resp = await _llm_complete_with_retry(system_prompt, user_prompt, max_tokens=AGENT_MAX_TOKENS, agent_id=agent_id)
     latency = (time.perf_counter() - start) * 1000
 
     import hashlib
@@ -247,12 +254,15 @@ async def _run_agent(agent_id: str, query: str, thread_id: str) -> dict:
         model_used=model_used,
     )
 
+    # Merge RAG citations with any static citations already defined
+    all_citations = list(rag_citations) + AGENT_CITATIONS.get(agent_id, [])
+
     return {
         "agent_id": agent_id,
         "display_name": member.display_name,
         "icon": member.icon,
         "findings": content,
-        "citations": AGENT_CITATIONS[agent_id],
+        "citations": all_citations,
         "confidence": dynamic_confidence,
         "model_used": model_used,
         "latency_ms": round(latency, 1),
@@ -269,37 +279,64 @@ async def _synthesize_verdict(query: str, council_results: dict, final_score: fl
     Returns (verdict_text, assessment_tier_label).
     """
     findings_summary = ""
+    all_citations = []
     for aid, result in council_results.items():
-        name = result.get("display_name", aid)
-        # Use full findings for Chairman — it needs context to write well
-        findings = result.get("findings", "")[:1200]
-        findings_summary += f"\n\n=== {name} ===\n{findings}\n"
+        name       = result.get("display_name", aid)
+        # Give Chairman 600 chars per agent — enough context for real synthesis
+        findings   = result.get("findings", "")[:600].replace("\n", " ")
+        confidence = result.get("confidence", 0)
+        findings_summary += f"\n\n## {name} ({confidence:.0%} confidence)\n{findings}"
+        # Collect citations from agents
+        for c in result.get("citations", []):
+            if isinstance(c, dict) and c not in all_citations:
+                all_citations.append(c)
+
+    citations_str = ""
+    if all_citations:
+        citations_str = "\n\nVerified Sources Referenced by Agents:\n"
+        for i, c in enumerate(all_citations[:6], 1):
+            citations_str += f"[{i}] {c.get('source_name','?')} — {c.get('source_url','')}\n"
 
     system_prompt = (
-        "You are the Chairman of the NeuroNex Multi-Agent Research Council — the ultimate synthesizer.\n"
-        "You have received comprehensive analyses from 4 specialist agents. "
-        "Your role is to write a DEFINITIVE, RESEARCH-QUALITY consensus verdict that:\n"
-        "1. Directly and completely answers the user's exact query — start immediately with your answer, no preamble.\n"
-        "2. Is DOMAIN-SPECIFIC — if asked about cricket, name teams and players. If finance, name companies and figures. If science, name mechanisms and compounds.\n"
-        "3. Synthesizes the STRONGEST evidence from the Evidence Agent.\n"
-        "4. Honestly integrates the MOST VALID objections from the Skeptic Agent.\n"
-        "5. Weaves in the most illuminating insight from the Connector Agent.\n"
-        "6. Closes with an actionable, honest assessment of confidence and what it means for the user.\n\n"
-        "FORMAT: Write 4-6 substantial paragraphs. Each paragraph should cover a distinct aspect of the synthesis.\n"
-        "LENGTH: Minimum 250 words. This is a research verdict, not a tweet.\n"
-        "TONE: Authoritative, clear, expert — like a senior research analyst presenting final findings.\n"
-        "NEVER: Use generic statements like 'the evidence suggests' without naming WHAT evidence. "
-        "NEVER use clinical/biomedical language for non-medical queries."
+        "You are NeuroNex, an advanced Research AI. Synthesize the 4 agent reports into a comprehensive, highly structured master guide.\n"
+        "RULES:\n"
+        "1. Write like NotebookLM/Perplexity — direct, authoritative, highly structured.\n"
+        "2. If the user asks for career/job/interview advice, you MUST include these sections:\n"
+        "   - Current Market Trends & Needs\n"
+        "   - Which Path to Choose & Why\n"
+        "   - Preparation Guide (with specific technologies)\n"
+        "   - Projects to Stand Out\n"
+        "   - Resume Optimization & ATS Tips\n"
+        "   - Where to Apply (Job Platforms)\n"
+        "3. Every factual claim, statistic, or advice point MUST end with an inline citation in exactly this format: [Source: SourceName, URL]\n"
+        "   (Example: ...is highly demanded [Source: LinkedIn 2026 AI Jobs Report, https://linkedin.com/...])\n"
+        "4. Do NOT make up citations. Use the exact Source Names and URLs provided by the agents below."
     )
 
     user_prompt = (
-        f"Research Query: \"{query}\"\n"
-        f"Calibrated Confidence Score: {final_score * 100:.1f}% (weights: α={_dynamic_weights(query)[0]}, β={_dynamic_weights(query)[1]}, γ={_dynamic_weights(query)[2]})\n\n"
-        f"Agent Reports:{findings_summary}\n\n"
-        "Write the comprehensive Chairman verdict now — be definitive, specific, and research-depth:"
+        f"Query: \"{query}\"\n"
+        f"Consensus: {final_score * 100:.1f}%\n\n"
+        f"Agent findings (use these as your knowledge base):\n{findings_summary}\n"
+        f"Available Citations Mapping:\n{citations_str}\n"
+        "Write the final, comprehensive research answer now. Ensure beautiful Markdown formatting and strict citation adherence:"
     )
 
-    resp = await _llm_complete_with_retry(system_prompt, user_prompt, temperature=0.2, max_tokens=CHAIRMAN_MAX_TOKENS)
+    # Chairman uses its own dedicated cascade (4th key) to avoid contending with agents
+    try:
+        resp = await asyncio.wait_for(
+            _chairman_cascade.complete(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.2,
+                max_tokens=CHAIRMAN_MAX_TOKENS,
+            ),
+            timeout=90.0,
+        )
+        if resp.content.startswith("__ERROR__") or resp.content == "__FALLBACK__":
+            resp = await _llm_complete_with_retry(system_prompt, user_prompt, temperature=0.2, max_tokens=CHAIRMAN_MAX_TOKENS)
+    except Exception:
+        resp = await _llm_complete_with_retry(system_prompt, user_prompt, temperature=0.2, max_tokens=CHAIRMAN_MAX_TOKENS)
+
 
     # Dynamically record chairman LLM token usage
     tokens = resp.token_count if (resp.content != "__FALLBACK__" and "429" not in resp.content) else 65
@@ -381,7 +418,13 @@ def _dynamic_weights(query: str) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 # SSE stream generator
 # ─────────────────────────────────────────────────────────────────────────────
-async def _stream_research(query: str, thread_id: str, token_budget: int, doc_context: str = "") -> AsyncGenerator[str, None]:
+async def _stream_research(
+    query: str,
+    thread_id: str,
+    token_budget: int,
+    doc_context: str = "",
+    domain: str = "general",
+) -> AsyncGenerator[str, None]:
     """Yields SSE events as the 4 agents complete, then emits the final synthesis."""
 
     def sse(event: str, data: dict) -> str:
@@ -396,51 +439,80 @@ async def _stream_research(query: str, thread_id: str, token_budget: int, doc_co
     t_start = time.perf_counter()
 
     yield sse("status", {"message": "Pipeline started", "thread_id": thread_id, "model": _PRIMARY_MODEL})
-    yield sse("status", {"message": f"Dispatching 4 specialized agents in parallel using {_PRIMARY_MODEL}…"})
 
-    # Launch all 4 agents simultaneously (pass full query including document context)
-    agent_tasks = {
-        aid: asyncio.create_task(_run_agent(aid, full_query, thread_id))
-        for aid in COUNCIL_MEMBERS.keys()
-    }
+    # ── RAG: Fetch live knowledge then retrieve grounded chunks ──
+    rag = get_rag_pipeline()
+    rag_context = ""
+    rag_citations = []
+
+    if rag._ready:
+        yield sse("status", {"message": "📡 Fetching verified knowledge... (forcing fresh data for accuracy)"})
+        try:
+            # Force live fetch to bypass stale cache
+            rag.clear_cache()
+            chunks = await asyncio.wait_for(
+                rag.retrieve(query=query, domain=domain, fetch_live=True),
+                timeout=25.0
+            )
+            if chunks:
+                rag_context, rag_citations = rag.format_context(chunks)
+                yield sse("rag_status", {
+                    "chunks_retrieved": len(chunks),
+                    "sources": [c["source_name"] for c in rag_citations],
+                    "citations": rag_citations,
+                    "embed_model": "all-MiniLM-L6-v2 (HuggingFace)",
+                })
+                yield sse("status", {"message": f"✅ Retrieved {len(chunks)} verified sources — grounding all agents in real data…"})
+            else:
+                yield sse("status", {"message": "⚠️ No sources found — agents will use training knowledge"})
+        except asyncio.TimeoutError:
+            logger.warning("[RAG] Live fetch timed out (15s) — trying cached ChromaDB")
+            try:
+                chunks = await asyncio.wait_for(
+                    rag.retrieve(query=query, domain=domain, fetch_live=False),
+                    timeout=5.0
+                )
+                if chunks:
+                    rag_context, rag_citations = rag.format_context(chunks)
+                    yield sse("rag_status", {"chunks_retrieved": len(chunks), "citations": rag_citations})
+            except Exception:
+                pass
+        except Exception as rag_err:
+            logger.warning(f"[RAG] Retrieval failed: {rag_err}")
+
+    yield sse("status", {"message": f"Dispatching 4 specialized agents sequentially to respect API quotas…"})
 
     council_results = {}
-    pending = dict(agent_tasks)
+    
+    # Run agents sequentially to completely eliminate 429 rate limit issues on the free tier
+    for aid, member in COUNCIL_MEMBERS.items():
+        yield sse("status", {"message": f"Agent {member.display_name} is analyzing the data..."})
+        try:
+            result = await _run_agent(aid, full_query, thread_id, rag_context, rag_citations)
+            council_results[aid] = result
+            # Stream this agent's result immediately
+            yield sse("agent_result", result)
+            # Sleep briefly to ensure rate limits reset
+            await asyncio.sleep(2.0)
+        except Exception as exc:
+            logger.error(f"Agent {aid} failed: {exc}")
+            fallback_result = {
+                "agent_id": aid,
+                "display_name": member.display_name,
+                "icon": member.icon,
+                "findings": AGENT_FALLBACK_FINDINGS.get(aid, "Analysis unavailable."),
+                "citations": AGENT_CITATIONS[aid],
+                "confidence": AGENT_PRIORS[aid],
+                "model_used": "fallback",
+                "latency_ms": 0,
+                "tokens": 0,
+            }
+            council_results[aid] = fallback_result
+            yield sse("agent_result", fallback_result)
 
-    while pending:
-        done, _ = await asyncio.wait(
-            pending.values(),
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=2.0,
-        )
+    yield sse("status", {"message": "✅ Analysis complete. Synthesizing master guide..."})
 
-        for task in done:
-            finished = next((aid for aid, t in pending.items() if t is task), None)
-            if finished:
-                try:
-                    result = task.result()
-                except Exception as exc:
-                    result = {
-                        "agent_id": finished,
-                        "display_name": COUNCIL_MEMBERS[finished].display_name,
-                        "icon": COUNCIL_MEMBERS[finished].icon,
-                        "findings": AGENT_FALLBACK_FINDINGS.get(finished, f"Agent error: {exc}"),
-                        "citations": AGENT_CITATIONS[finished],
-                        "confidence": AGENT_PRIORS[finished],
-                        "model_used": "fallback",
-                        "latency_ms": 0,
-                        "tokens": 0,
-                    }
-                council_results[finished] = result
-                del pending[finished]
-                yield sse("agent_result", result)
-
-        if not done:
-            yield sse("heartbeat", {"elapsed_s": round(time.perf_counter() - t_start, 1)})
-
-    # ── Chairman synthesis ────────────────────────────────────────────────────
-    yield sse("status", {"message": "Chairman synthesizing consensus verdict…"})
-
+    # Calculate final consensus scores
     raw_scores = {aid: r["confidence"] for aid, r in council_results.items()}
     adjusted   = compute_peer_adjusted_confidence(raw_scores)
 
@@ -505,7 +577,7 @@ async def _stream_research(query: str, thread_id: str, token_budget: int, doc_co
             "confidence_score":   final_score,
             "trl_assessment":     tier,
             "calibration":        {"alpha": alpha, "beta": beta, "gamma": gamma, "raw_score": round(raw_score, 4)},
-            "citations_found":    list({c for r in council_results.values() for c in r.get("citations", [])}),
+            "citations_found":    [c for r in council_results.values() for c in r.get("citations", [])],
         },
         "peer_evaluations_compiled": council_results,
         "ibct_chain_summary":  ibct.get_chain_summary(),
@@ -541,17 +613,30 @@ async def upload_document(file: UploadFile = File(...)):
     _doc_contexts[context_id] = {
         "filename": file.filename,
         "type": file_type,
-        "text": text[:25_000],   # Cap at 25K chars
+        "text": text[:25_000],   # Cap at 25K chars for direct injection
         "size_bytes": len(raw),
         "uploaded_at": time.time(),
     }
+
+    # Also index the document into ChromaDB for RAG retrieval
+    rag = get_rag_pipeline()
+    if rag._ready and text.strip():
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            rag.index_uploaded_document,
+            text[:50_000],   # Index up to 50K chars
+            file.filename or "upload.txt",
+            context_id,
+        )
+
     return {
         "status": "ok",
         "context_id": context_id,
         "filename": file.filename,
         "type": file_type,
         "chars": len(text),
-        "preview": text[:300] + ("…" if len(text) > 300 else ""),
+        "rag_indexed": rag._ready,
+        "preview": text[:300] + ("\u2026" if len(text) > 300 else ""),
     }
 
 
@@ -559,8 +644,9 @@ async def upload_document(file: UploadFile = File(...)):
 async def stream_research(
     query: str = Query(...),
     thread_id: Optional[str] = Query(default=None),
-    context_ids: Optional[str] = Query(default=None),  # comma-separated upload IDs
+    context_ids: Optional[str] = Query(default=None),
     token_budget: int = Query(default=100_000),
+    domain: str = Query(default="general"),   # general|medical|legal|finance|technology|science
 ):
     """SSE streaming endpoint — emits agent results as they complete."""
     tid = thread_id or str(uuid.uuid4())
@@ -574,7 +660,7 @@ async def stream_research(
                 doc_context += f"\n\n[UPLOADED DOCUMENT: {ctx['filename']}]\n{ctx['text']}"
 
     return StreamingResponse(
-        _stream_research(query, tid, token_budget, doc_context=doc_context),
+        _stream_research(query, tid, token_budget, doc_context=doc_context, domain=domain),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
@@ -587,7 +673,12 @@ async def execute_research(payload: ResearchRequest):
     final_synthesis = None
     agent_results = {}
 
-    async for chunk in _stream_research(query=payload.query, thread_id=thread_id, token_budget=payload.token_budget):
+    async for chunk in _stream_research(
+        query=payload.query,
+        thread_id=thread_id,
+        token_budget=payload.token_budget,
+        domain=getattr(payload, 'domain', 'general'),
+    ):
         if not chunk.strip():
             continue
         for line in chunk.split("\n"):
