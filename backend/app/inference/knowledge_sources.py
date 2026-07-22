@@ -57,6 +57,7 @@ class KnowledgeFetcher:
 
         if "wikipedia" in sources:
             tasks.append(self._fetch_wikipedia(query))
+            tasks.append(self._fetch_web_news(query))  # Fallback/complement for breaking news
         if "arxiv" in sources:
             tasks.append(self._fetch_arxiv(query))
         if "pubmed" in sources:
@@ -64,6 +65,7 @@ class KnowledgeFetcher:
         if "fred" in sources:
             tasks.append(self._fetch_fred(query))
         
+        # Intercept career/job queries to provide rich web data (simulated search)
         # Intercept career/job queries to provide rich web data (simulated search)
         career_keywords = ["job", "career", "hire", "fresher", "interview", "resume", "salary"]
         if any(k in query.lower() for k in career_keywords):
@@ -81,20 +83,71 @@ class KnowledgeFetcher:
         logger.info(f"[KnowledgeFetcher] Fetched {len(docs)} documents for query: '{query[:50]}'")
         return docs
 
+    def _clean_query(self, query: str) -> str:
+        """Removes conversational filler words to improve API search results."""
+        stop_words = [
+            "tell", "me", "about", "abt", "the", "what", "is", "explain", "latest", 
+            "update", "on", "ur", "your", "views", "action", "sol", "solution", 
+            "can", "take", "and", "how", "why", "please", "pls", "details", "give", "bje", "bjp"
+        ]
+        words = query.lower().split()
+        cleaned = [w for w in words if w not in stop_words]
+        return " ".join(cleaned) if cleaned else query
+
+    async def _fetch_web_news(self, query: str) -> List[Dict]:
+        """
+        Fetches breaking news from Google News RSS.
+        Provides accurate publication dates and highly recent articles.
+        """
+        docs = []
+        search_query = self._clean_query(query)
+        try:
+            async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "NeuroNex/1.0"}) as client:
+                resp = await client.get(
+                    f"https://news.google.com/rss/search?q={search_query}&hl=en-US&gl=US&ceid=US:en"
+                )
+                resp.raise_for_status()
+                import xml.etree.ElementTree as ET
+                import re
+                root = ET.fromstring(resp.text)
+                
+                combined_text = ""
+                for item in root.findall('.//item')[:5]:
+                    title = item.find('title').text if item.find('title') is not None else ""
+                    pub_date = item.find('pubDate').text if item.find('pubDate') is not None else ""
+                    # The description usually contains HTML, strip it
+                    desc = item.find('description').text if item.find('description') is not None else ""
+                    clean_desc = re.sub(r'<[^>]+>', ' ', desc).strip()
+                    
+                    if title:
+                        combined_text += f"- [{pub_date}] {title}: {clean_desc}\n"
+                
+                if combined_text:
+                    docs.append({
+                        "title": f"Live News Results for: {search_query}",
+                        "text": combined_text,
+                        "url": f"https://news.google.com/search?q={search_query.replace(' ', '+')}",
+                        "source_type": "web_news"
+                    })
+        except Exception as e:
+            logger.warning(f"[WebNews] Fetch failed: {e}")
+        return docs
+
     async def _fetch_wikipedia(self, query: str) -> List[Dict]:
         """
         Fetch Wikipedia summary + full first section for the query.
         Uses Wikipedia REST API — no API key needed, free, fast.
         """
         docs = []
+        search_query = self._clean_query(query)
         try:
             # Wikipedia search to find relevant articles
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "NeuroNex/1.0 (Contact: admin@neuronex.com)"}) as client:
                 search_url = "https://en.wikipedia.org/w/api.php"
                 search_params = {
                     "action": "query",
                     "list": "search",
-                    "srsearch": query,
+                    "srsearch": search_query,
                     "srlimit": 3,
                     "format": "json",
                 }
@@ -168,18 +221,15 @@ class KnowledgeFetcher:
         ]
 
     async def _fetch_arxiv(self, query: str) -> List[Dict]:
-        """
-        Fetch recent ArXiv papers related to the query.
-        Uses ArXiv API — free, no key needed.
-        Returns title + abstract for each paper.
-        """
+        """Fetch latest relevant papers from ArXiv."""
         docs = []
+        search_query = self._clean_query(query)
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 # ArXiv Atom API
                 url = "https://export.arxiv.org/api/query"
                 params = {
-                    "search_query": f"all:{query}",
+                    "search_query": f"all:{search_query}",
                     "start": 0,
                     "max_results": 4,
                     "sortBy": "relevance",

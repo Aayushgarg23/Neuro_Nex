@@ -100,8 +100,8 @@ _qaoa_scheduler = QAOATaskScheduler(p_layers=1)
 AGENT_TIMEOUT_SECONDS = 90    # 90s per agent — enough for slow API responses
 
 # Token budgets — meaningful responses without hitting context limits
-AGENT_MAX_TOKENS    = 1500   # ~225 words per agent — real, useful responses
-CHAIRMAN_MAX_TOKENS = 2500   # ~375 words — a comprehensive synthesis guide
+AGENT_MAX_TOKENS    = 3000   # ~2000 words per agent for exhaustive deep-dives
+CHAIRMAN_MAX_TOKENS = 4000   # Massive synthesis allowance for research-grade reports
 
 # In-memory document context store (keyed by context_id)
 _doc_contexts: dict = {}
@@ -212,19 +212,22 @@ async def _run_agent(
     rag_citations = rag_citations or []
 
     AGENT_ROLES = {
-        "evidence_agent":  "You find and present factual evidence. Be specific — cite data, numbers, facts from the sources.",
-        "skeptic_agent":   "You challenge the evidence. Find gaps, contradictions, or missing context in the sources.",
-        "connector_agent": "You find cross-domain connections. Link the topic to other fields, trends, or implications.",
-        "quality_agent":   "You assess source quality and methodology. Rate the reliability of the retrieved data.",
+        "evidence_agent":  "You find and present factual evidence. Be EXHAUSTIVELY detailed. Extract every relevant data point, statistic, and fact from the sources. Write at least 3-4 comprehensive paragraphs.",
+        "skeptic_agent":   "You challenge the evidence. Find gaps, contradictions, or missing context in the sources. Be EXHAUSTIVELY detailed. Scrutinize every claim deeply. Write at least 3-4 comprehensive paragraphs.",
+        "connector_agent": "You find cross-domain connections. Link the topic to other fields, trends, or implications. Be EXHAUSTIVELY detailed. Explore secondary and tertiary implications. Write at least 3-4 comprehensive paragraphs.",
+        "quality_agent":   "You assess source quality and methodology. Rate the reliability of the retrieved data. Be EXHAUSTIVELY detailed in evaluating biases, sample sizes, and publisher credibility. Write at least 3-4 comprehensive paragraphs.",
     }
 
-    rag_injection = f"\n\nKNOWLEDGE BASE (CITE THESE SPECIFICALLY):\n{rag_context}\n" if rag_context.strip() else ""
+    import datetime
+    current_date = datetime.datetime.now().strftime("%B %d, %Y")
+    
+    rag_injection = f"\n\nCURRENT DATE: {current_date}\n\nKNOWLEDGE BASE (CITE THESE SPECIFICALLY):\n{rag_context}\n" if rag_context.strip() else f"\n\nCURRENT DATE: {current_date}\n"
 
     system_prompt = (
         f"{AGENT_ROLES.get(agent_id, member.system_prompt)}"
         f"{rag_injection}"
-        "Write 2 focused paragraphs. You MUST use inline citations formatted exactly like this: [Source: SourceName, URL]. "
-        "Be specific and direct."
+        "You MUST use inline citations formatted exactly like this: [Source: SourceName, URL]. "
+        "Do not summarize briefly. Provide extreme detail, exhaustive context, and highly elaborate analysis."
     )
 
     user_prompt = f"Query: \"{query}\"\n\nAnalysis (cite sources inline using [Source: Name, URL]):"
@@ -297,20 +300,39 @@ async def _synthesize_verdict(query: str, council_results: dict, final_score: fl
         for i, c in enumerate(all_citations[:6], 1):
             citations_str += f"[{i}] {c.get('source_name','?')} — {c.get('source_url','')}\n"
 
+    # Dynamically inject career rules ONLY if the query is actually about careers
+    career_keywords = ["job", "career", "hire", "fresher", "interview", "resume", "salary", "apply"]
+    is_career_query = any(k in query.lower() for k in career_keywords)
+    
+    career_rules = ""
+    if is_career_query:
+        career_rules = (
+            "2. As this is a career/job query, you MUST structure your answer with these sections:\n"
+            "   - Current Market Trends & Needs\n"
+            "   - Which Path to Choose & Why\n"
+            "   - Preparation Guide (with specific technologies)\n"
+            "   - Projects to Stand Out\n"
+            "   - Resume Optimization & ATS Tips\n"
+            "   - Where to Apply (Job Platforms)\n"
+        )
+    else:
+        career_rules = (
+            "2. Structure your answer logically with relevant headers, bullet points, and concise paragraphs.\n"
+        )
+
+    import datetime
+    current_date = datetime.datetime.now().strftime("%B %d, %Y")
+
     system_prompt = (
-        "You are NeuroNex, an advanced Research AI. Synthesize the 4 agent reports into a comprehensive, highly structured master guide.\n"
+        "You are NeuroNex, an elite Research Analyst AI. Synthesize the 4 agent reports into a massively comprehensive, highly structured master guide.\n"
+        f"CURRENT SYSTEM DATE: {current_date}\n\n"
         "RULES:\n"
-        "1. Write like NotebookLM/Perplexity — direct, authoritative, highly structured.\n"
-        "2. If the user asks for career/job/interview advice, you MUST include these sections:\n"
-        "   - Current Market Trends & Needs\n"
-        "   - Which Path to Choose & Why\n"
-        "   - Preparation Guide (with specific technologies)\n"
-        "   - Projects to Stand Out\n"
-        "   - Resume Optimization & ATS Tips\n"
-        "   - Where to Apply (Job Platforms)\n"
-        "3. Every factual claim, statistic, or advice point MUST end with an inline citation in exactly this format: [Source: SourceName, URL]\n"
+        "1. Write like a top-tier academic or market research report — direct, authoritative, and EXTREMELY elaborative.\n"
+        f"{career_rules}"
+        "3. Your output MUST be highly detailed. Do not leave out any insights provided by the agents. Expand on concepts thoroughly to ensure the user has a complete understanding. Use sub-headers, lists, and deep paragraphs extensively.\n"
+        "4. Every factual claim, statistic, or advice point MUST end with an inline citation in exactly this format: [Source: SourceName, URL]\n"
         "   (Example: ...is highly demanded [Source: LinkedIn 2026 AI Jobs Report, https://linkedin.com/...])\n"
-        "4. Do NOT make up citations. Use the exact Source Names and URLs provided by the agents below."
+        "5. Do NOT make up citations. Use the exact Source Names and URLs provided by the agents below."
     )
 
     user_prompt = (
